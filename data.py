@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Iterable
 
 import datasets
 import torch
 from torch.utils.data import DataLoader, IterableDataset
-from transformers import LlamaTokenizerFast
-
-if False:  # type-checking placeholder without runtime import
-    from main import Config  # pragma: no cover
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 class PackedStreamingDataset(IterableDataset):
     """
@@ -17,7 +14,7 @@ class PackedStreamingDataset(IterableDataset):
     """
 
     def __init__(self, stream, tokenizer_path: str, seq_len: int) -> None:
-        self.tokenizer = LlamaTokenizerFast.from_pretrained(
+        self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
             tokenizer_path,
             use_fast=True,
         )
@@ -45,7 +42,7 @@ class PackedStreamingDataset(IterableDataset):
                 }
 
 
-def format_to_text(example: Dict[str, Any], tokenizer: LlamaTokenizerFast) -> Dict[str, str]:
+def format_to_text(example: Dict[str, Any], tokenizer: PreTrainedTokenizerBase) -> Dict[str, str]:
     text = example.get("text")
     if isinstance(text, str) and text.strip():
         return {"text": text}
@@ -67,7 +64,8 @@ def has_text(example: Dict[str, Any]) -> bool:
 
 
 def build_dataloader(cfg: "Config", tokenizer_path: str) -> DataLoader:
-    template_tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_path, use_fast=True)
+    print(f"[data] loading tokenizer from {tokenizer_path}", flush=True)
+    template_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
 
     def map_fn(example):
         return format_to_text(example, template_tokenizer)
@@ -78,20 +76,25 @@ def build_dataloader(cfg: "Config", tokenizer_path: str) -> DataLoader:
         .filter(has_text)
         .repeat()
     )
+    print(f"[data] dataset A ready", flush=True)
     ds_b = (
         datasets.load_dataset(cfg.dataset_b, split="train", streaming=True)
         .map(map_fn)
         .filter(has_text)
         .repeat()
     )
+    print(f"[data] dataset B ready", flush=True)
 
-    stream = datasets.interleave_datasets(
+    print("[data] interleaving + shuffling streams", flush=True)
+    repeated_stream = datasets.interleave_datasets(
         [ds_a, ds_b],
         probabilities=[cfg.dataset_ratio_a, 1.0 - cfg.dataset_ratio_a],
         seed=cfg.seed,
     ).shuffle(buffer_size=cfg.shuffle_buffer_size, seed=cfg.seed)
 
-    iterable = PackedStreamingDataset(stream, tokenizer_path, cfg.seq_len)
+    print("[data] packing tokens into sequences", flush=True)
+    iterable = PackedStreamingDataset(repeated_stream, tokenizer_path, cfg.seq_len)
+    print("[data] dataloader ready", flush=True)
     return DataLoader(
         iterable,
         batch_size=cfg.batch_size,

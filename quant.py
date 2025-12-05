@@ -64,6 +64,8 @@ class QuantLinear(nn.Module):
         self,
         in_features,
         out_features,
+        batch_size: int,
+        seq_len: int,
         bits: int = 8,
         sample_count: int = 5,
         percentile: float = 0.9999,
@@ -78,12 +80,18 @@ class QuantLinear(nn.Module):
         self.percentile = percentile
         self.sample_count = sample_count
         self.samples_collected = 0
-        self.register_buffer("act_samples", torch.empty(sample_count, in_features))
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.register_buffer(
+            "act_samples",
+            torch.empty(sample_count, batch_size, seq_len, in_features),
+        )
 
     def forward(self, x):
         if self.samples_collected < self.sample_count:
             with torch.no_grad():
-                self.act_samples[self.samples_collected] = x.detach()
+                sample = x.detach().to(dtype=self.act_samples.dtype)
+                self.act_samples[self.samples_collected].copy_(sample)
                 self.samples_collected += 1
                 if self.samples_collected == self.sample_count:
                     act_s = torch.quantile(self.act_samples.abs().flatten(), self.percentile)
@@ -101,24 +109,28 @@ class QuantLinear(nn.Module):
 
             b = float(self.qmax) - 0.5
             rows = self.weight
-            progress = None
-            if show_progress:
-                progress = tqdm(
-                    total=rows.shape[0],
-                    desc=desc or "calibrating scales",
-                    leave=False,
-                )
+            progress = tqdm(
+                total=rows.shape[0],
+                desc=desc or "calibrating scales",
+                leave=False,
+            )
 
             scales = []
             for row in rows:
-                scales.append(solve_silq_scale(row.abs(), b))
-                if progress is not None:
-                    progress.update(1)
+                per_row_max = row.abs().max().clamp_min(1e-12)
+                scale = per_row_max / b
+                scales.append(scale)
+                # scales.append(solve_silq_scale(row.abs(), b))
+                progress.update(1)
 
-            if progress is not None:
-                progress.close()
+            progress.close()
 
             self.log_weight_s.copy_(torch.stack(scales).unsqueeze(1).log())
+
+    def set_trainable(self, enabled: bool) -> None:
+        self.weight.requires_grad = enabled
+        self.log_weight_s.requires_grad = enabled
+        self.log_act_s.requires_grad = enabled
             
 
 def solve_silq_scale(row_abs: torch.Tensor, b: float) -> torch.Tensor:

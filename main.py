@@ -1,15 +1,20 @@
 import argparse
+import math
 import torch
+import torch.nn.functional as F
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Sequence
 from transformers import LlamaForCausalLM
 from tqdm.auto import tqdm
-import lm_eval
-from lm_eval.models.huggingface import HFLM
 
-from quant import QuantLinear
-from data import build_dataloader
+from .eval import evaluate_model, extract_basic_metrics
+from .quant import QuantLinear
+from .data import build_dataloader
+
+
+class ConfigDefaults:
+    eval_tasks: tuple[str, ...] = ("gsm8k", "truthfulqa_mc1", "ifeval")
 
 
 @dataclass
@@ -18,11 +23,11 @@ class Config:
     grad_accum_steps: int = 1
     batch_size: int = 1
     seq_len: int = 16
-    device: str = "cpu"
+    device: str = "cuda"
     # CPU loads are faster in float32 even if the base checkpoint ships bf16 weights.
     dtype: str = "float32"
-    student_model_path: str = "~/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    teacher_model_path: str = "~/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    student_model_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    teacher_model_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     lr: float = 0.1
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
@@ -37,15 +42,93 @@ class Config:
     eval_interval: int = 500
     checkpoint_dir: str = "checkpoints"
     resume_from: str = ""  # path to checkpoint.pt to resume from
-    eval_tasks: List[str] = field(default_factory=lambda: ["hellaswag", "piqa", "winogrande"])
+    eval_tasks: List[str] = field(default_factory=lambda: list(ConfigDefaults.eval_tasks))
+    train_layers: tuple[int, ...] = field(default_factory=tuple)  # decoder layer indices to update
+    eval_limit: Optional[float] = None  # fraction of eval dataset per task
 
 
 def parse_args() -> Config:
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=Config.steps)
     parser.add_argument("--batch-size", dest="batch_size", type=int, default=Config.batch_size)
+    parser.add_argument(
+        "--train-layers",
+        type=str,
+        required=True,
+        help="Comma-separated decoder layer indices to finetune",
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=Config.checkpoint_interval,
+        help="Save a checkpoint every N steps (0 to disable)",
+    )
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        default=Config.eval_interval,
+        help="Run evaluation every N steps (0 to disable)",
+    )
+    parser.add_argument(
+        "--eval-tasks",
+        type=str,
+        default=",".join(ConfigDefaults.eval_tasks),
+        help="Comma-separated lm_eval task names (must be non-script datasets)",
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=Config.log_interval,
+        help="Update progress bar metrics every N steps",
+    )
+    parser.add_argument(
+        "--seq-len",
+        dest="seq_len",
+        type=int,
+        default=Config.seq_len,
+        help="Sequence length for packed training batches",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=Config.resume_from,
+        help="Path to checkpoint.pt to resume from",
+    )
+    parser.add_argument(
+        "--eval-limit",
+        dest="eval_limit",
+        type=float,
+        default=None,
+        help="Optional fraction of eval examples per task (e.g., 0.01)",
+    )
     args = parser.parse_args()
-    return Config(steps=args.steps, batch_size=args.batch_size)
+    raw_train_layers = args.train_layers.strip()
+    if not raw_train_layers:
+        raise ValueError("--train-layers requires at least one integer index")
+    try:
+        train_layers = tuple(int(tok) for tok in raw_train_layers.split(",") if tok.strip())
+    except ValueError as exc:
+        raise ValueError("--train-layers must be a comma-separated list of integers") from exc
+    if not train_layers:
+        raise ValueError("--train-layers requires at least one integer index")
+    eval_tasks = tuple(
+        task.strip()
+        for task in args.eval_tasks.split(",")
+        if task.strip()
+    ) or tuple(Config.eval_tasks)
+
+    return Config(
+        steps=args.steps,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        train_layers=train_layers,
+        checkpoint_interval=args.checkpoint_interval,
+        eval_interval=args.eval_interval,
+        log_interval=args.log_interval,
+        eval_tasks=list(eval_tasks),
+        resume_from=args.resume_from,
+        eval_limit=args.eval_limit,
+    )
 
 
 def resolve_model_path(path_str: str) -> str:
@@ -79,15 +162,29 @@ def compute_kl_loss(
     return (token_kl * mask).sum() / mask.sum()
 
 
+def compute_token_cross_entropy(
+    logits: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor
+) -> torch.Tensor:
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    shift_mask = attention_mask[:, 1:].contiguous().view(-1).float()
+    vocab_size = shift_logits.size(-1)
+    loss = F.cross_entropy(
+        shift_logits.view(-1, vocab_size),
+        shift_labels.view(-1),
+        reduction="none",
+    )
+    mask_sum = shift_mask.sum()
+    if mask_sum == 0:
+        return torch.tensor(0.0, device=logits.device)
+    return (loss * shift_mask).sum() / mask_sum
+
+
 def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> LlamaForCausalLM:
-    print(f"  -> from_pretrained({model_path})", flush=True)
     model = LlamaForCausalLM.from_pretrained(model_path, dtype=dtype)
-    print("  -> configuring", flush=True)
     model.config.use_cache = False
     model.eval()
-    print(f"  -> moving to {device}", flush=True)
     model = model.to(device)
-    print("  -> model ready", flush=True)
     return model
 
 
@@ -96,30 +193,41 @@ def freeze(model: torch.nn.Module) -> None:
         param.requires_grad = False
 
 
-def _iter_linear_modules(module: torch.nn.Module):
+def _iter_linear_modules(module: torch.nn.Module, prefix: str = ""):
     for name, child in module.named_children():
+        child_prefix = f"{prefix}.{name}" if prefix else name
         if isinstance(child, torch.nn.Linear):
             yield module, name, child
         else:
-            yield from _iter_linear_modules(child)
+            yield from _iter_linear_modules(child, child_prefix)
 
 
-def swap_linear_with_quant(module: torch.nn.Module) -> None:
-    linears = list(_iter_linear_modules(module))
-    for parent, name, child in tqdm(linears, desc="swap linears", leave=False):
-        quant = QuantLinear(child.in_features, child.out_features)
-        # Reuse the existing weight parameter to avoid an extra copy.
+def _iter_layer_linears(layers: Sequence[torch.nn.Module]):
+    for layer_index, layer in enumerate(layers):
+        for parent, name, child in _iter_linear_modules(layer):
+            yield layer_index, parent, name, child
+
+
+def swap_linear_with_quant(
+    module: torch.nn.Module,
+    train_layers: tuple[int, ...],
+    *,
+    batch_size: int,
+    seq_len: int,
+) -> None:
+    for layer_index, parent, name, child in _iter_layer_linears(module.model.layers):
+        if layer_index not in train_layers:
+            continue
+        quant = QuantLinear(
+            child.in_features,
+            child.out_features,
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
         quant.weight = child.weight
         quant.initialize(child, show_progress=True, desc=f"scales:{name}")
+        quant.set_trainable(True)
         setattr(parent, name, quant)
-
-
-def select_quant_params(model: LlamaForCausalLM):
-    for module in model.modules():
-        if isinstance(module, QuantLinear):
-            module.weight.requires_grad = True
-            module.log_weight_s.requires_grad = True
-            module.log_act_s.requires_grad = True
 
 
 def save_checkpoint(
@@ -161,18 +269,15 @@ def load_checkpoint(
 
 
 def evaluate(model: LlamaForCausalLM, cfg: Config) -> dict:
-    lm = HFLM(pretrained=model, batch_size=cfg.batch_size)
-    results = lm_eval.simple_evaluate(
-        model=lm,
+    results = evaluate_model(
+        model,
         tasks=cfg.eval_tasks,
         batch_size=cfg.batch_size,
+        limit=cfg.eval_limit,
     )
-    metrics = {}
-    for task, task_results in results["results"].items():
-        acc = task_results.get("acc,none") or task_results.get("acc")
-        if acc is not None:
-            metrics[task] = acc
-            print(f"  {task}: {acc:.4f}")
+    metrics = extract_basic_metrics(results.get("results", {}))
+    for task, acc in metrics.items():
+        print(f"  {task}: {acc:.4f}")
     return metrics
 
 
@@ -186,12 +291,13 @@ def run(cfg: Config) -> None:
 
     print("Loading student model...", flush=True)
     student = load_model(student_path, device, dtype)
-    print("  -> freezing student", flush=True)
     freeze(student)
-    print("  -> swapping Linear -> QuantLinear", flush=True)
-    swap_linear_with_quant(student)
-    print("  -> enabling grads on quant params", flush=True)
-    select_quant_params(student)
+    swap_linear_with_quant(
+        student,
+        cfg.train_layers,
+        batch_size=cfg.batch_size,
+        seq_len=cfg.seq_len,
+    )
 
     print("Loading teacher model...", flush=True)
     teacher = load_model(teacher_path, device, dtype)
@@ -199,7 +305,7 @@ def run(cfg: Config) -> None:
 
     optimizer = torch.optim.AdamW(student.parameters(), lr=cfg.lr, weight_decay=0.1)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, Tmax=cfg.steps, eta_min=cfg.lr * 0.1
+        optimizer, T_max=cfg.steps, eta_min=cfg.lr * 0.1
     )
 
     start_step = 0
@@ -222,7 +328,9 @@ def run(cfg: Config) -> None:
         optimizer.zero_grad()
 
         kl_total = 0.0
-    
+        student_ce_total = 0.0
+        teacher_ce_total = 0.0
+
         for _ in range(cfg.grad_accum_steps):
             batch = next(batch_iter)
 
@@ -237,12 +345,29 @@ def run(cfg: Config) -> None:
             kl_loss /= cfg.grad_accum_steps
             kl_loss.backward()
             kl_total += kl_loss.item()
+            student_ce = compute_token_cross_entropy(
+                student_logits.detach(), input_ids, attention_mask
+            )
+            teacher_ce = compute_token_cross_entropy(
+                teacher_logits, input_ids, attention_mask
+            )
+            student_ce_total += student_ce.item()
+            teacher_ce_total += teacher_ce.item()
 
         optimizer.step()
         scheduler.step()
 
+        avg_student_ce = student_ce_total / cfg.grad_accum_steps
+        avg_teacher_ce = teacher_ce_total / cfg.grad_accum_steps
+        student_ppl = math.exp(avg_student_ce)
+        teacher_ppl = math.exp(avg_teacher_ce)
+
         if step % cfg.log_interval == 0 or step == cfg.steps - 1:
-            progress.set_postfix(kl_loss=f"{kl_total:.6f}")
+            progress.set_postfix(
+                kl_loss=f"{kl_total:.6f}",
+                student_ppl=f"{student_ppl:.2f}",
+                teacher_ppl=f"{teacher_ppl:.2f}",
+            )
 
         if cfg.checkpoint_interval > 0 and (step + 1) % cfg.checkpoint_interval == 0:
             save_checkpoint(student, optimizer, scheduler, step + 1, cfg)
