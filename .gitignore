@@ -1,3 +1,5 @@
 .hf_home
 .uv_cache
 .venv
+__pycache__
+.pytest_cache
