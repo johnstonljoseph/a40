@@ -1,10 +1,14 @@
-#!/usr/bin/env python
 import argparse
 import json
-from typing import Iterable, Mapping, Sequence
+import os
+from pathlib import Path
+from typing import Mapping, Sequence
 
 import lm_eval  # pip install lm-eval
 from lm_eval.models.huggingface import HFLM
+
+_lm_eval_root = Path(lm_eval.__file__).resolve().parents[1]
+os.environ.setdefault("GIT_WORK_TREE", str(_lm_eval_root)); os.environ.setdefault("GIT_DIR", str(_lm_eval_root / ".git"))
 
 
 def evaluate_model(
@@ -31,11 +35,12 @@ def evaluate_model(
 
 
 def extract_basic_metrics(results: Mapping[str, Mapping[str, float]]) -> dict[str, float]:
+    """Flatten all numeric task metrics into a single dict for easy printing/logging."""
     metrics: dict[str, float] = {}
     for task, task_results in results.items():
-        acc = task_results.get("acc,none") or task_results.get("acc")
-        if acc is not None:
-            metrics[task] = acc
+        for metric_name, value in task_results.items():
+            if isinstance(value, (int, float)):
+                metrics[f"{task}/{metric_name}"] = float(value)
     return metrics
 
 

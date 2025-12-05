@@ -28,7 +28,7 @@ class Config:
     dtype: str = "float32"
     student_model_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     teacher_model_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    lr: float = 0.1
+    lr: float = 5e-6
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
     dataset_split: str = "train"
@@ -37,7 +37,7 @@ class Config:
     seed: int = 0
     num_workers: int = 1
     prefetch_factor: int = 2
-    log_interval: int = 10
+    log_interval: int = 3
     checkpoint_interval: int = 500
     eval_interval: int = 500
     checkpoint_dir: str = "checkpoints"
@@ -45,6 +45,7 @@ class Config:
     eval_tasks: List[str] = field(default_factory=lambda: list(ConfigDefaults.eval_tasks))
     train_layers: tuple[int, ...] = field(default_factory=tuple)  # decoder layer indices to update
     eval_limit: Optional[float] = None  # fraction of eval dataset per task
+    weight_scale_dir: str = ""  # optional directory with precomputed weight scales
 
 
 def parse_args() -> Config:
@@ -101,6 +102,12 @@ def parse_args() -> Config:
         default=None,
         help="Optional fraction of eval examples per task (e.g., 0.01)",
     )
+    parser.add_argument(
+        "--weight-scale-dir",
+        type=str,
+        default=Config.weight_scale_dir,
+        help="Directory containing per-layer weight scale files (optional)",
+    )
     args = parser.parse_args()
     raw_train_layers = args.train_layers.strip()
     if not raw_train_layers:
@@ -128,6 +135,7 @@ def parse_args() -> Config:
         eval_tasks=list(eval_tasks),
         resume_from=args.resume_from,
         eval_limit=args.eval_limit,
+        weight_scale_dir=args.weight_scale_dir,
     )
 
 
@@ -214,7 +222,9 @@ def swap_linear_with_quant(
     *,
     batch_size: int,
     seq_len: int,
+    weight_scale_dir: str = "",
 ) -> None:
+    scale_dir = Path(weight_scale_dir).expanduser() if weight_scale_dir else None
     for layer_index, parent, name, child in _iter_layer_linears(module.model.layers):
         if layer_index not in train_layers:
             continue
@@ -225,7 +235,19 @@ def swap_linear_with_quant(
             seq_len=seq_len,
         )
         quant.weight = child.weight
-        quant.initialize(child, show_progress=True, desc=f"scales:{name}")
+        used_scales = False
+        if scale_dir:
+            scale_path = scale_dir / f"layer{layer_index}_{name}.pt"
+            if scale_path.exists():
+                loaded = torch.load(scale_path, map_location="cpu")
+                if isinstance(loaded, dict) and "scales" in loaded:
+                    loaded = loaded["scales"]
+                quant.set_weight_scales(torch.as_tensor(loaded))
+                used_scales = True
+                print(f"[quant] loaded scales from {scale_path}")
+        if not used_scales:
+            quant.initialize(child, show_progress=True, desc=f"scales:{name}")
+        quant.to(child.weight.device)
         quant.set_trainable(True)
         setattr(parent, name, quant)
 
@@ -297,6 +319,7 @@ def run(cfg: Config) -> None:
         cfg.train_layers,
         batch_size=cfg.batch_size,
         seq_len=cfg.seq_len,
+        weight_scale_dir=cfg.weight_scale_dir,
     )
 
     print("Loading teacher model...", flush=True)

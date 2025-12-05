@@ -40,7 +40,9 @@ def test_quant_linear_initialize_matches_backprop_calibration(in_features, out_f
     with torch.no_grad():
         linear.weight.copy_(torch.randn_like(linear.weight))
 
-    quant_layer = quant.QuantLinear(in_features, out_features, bits=4)
+    batch_size = 1
+    seq_len = 1
+    quant_layer = quant.QuantLinear(in_features, out_features, batch_size, seq_len, bits=4)
     quant_layer.initialize(linear)
 
     b = float(quant_layer.qmax) - 0.5

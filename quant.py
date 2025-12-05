@@ -67,7 +67,7 @@ class QuantLinear(nn.Module):
         batch_size: int,
         seq_len: int,
         bits: int = 8,
-        sample_count: int = 5,
+        sample_count: int = 1,
         percentile: float = 0.9999,
     ):
         super().__init__()
@@ -94,7 +94,8 @@ class QuantLinear(nn.Module):
                 self.act_samples[self.samples_collected].copy_(sample)
                 self.samples_collected += 1
                 if self.samples_collected == self.sample_count:
-                    act_s = torch.quantile(self.act_samples.abs().flatten(), self.percentile)
+                    flat = self.act_samples.abs().flatten().to("cpu", dtype=torch.float32)
+                    act_s = torch.quantile(flat, self.percentile)
                     self.log_act_s.copy_(act_s.log())
             return F.linear(x, self.weight)
 
@@ -126,6 +127,12 @@ class QuantLinear(nn.Module):
             progress.close()
 
             self.log_weight_s.copy_(torch.stack(scales).unsqueeze(1).log())
+
+    def set_weight_scales(self, scales: torch.Tensor) -> None:
+        if scales.dim() != 1:
+            raise ValueError("Expected scales with shape [out_features]")
+        target = scales.view(-1, 1).to(dtype=self.log_weight_s.dtype, device=self.log_weight_s.device)
+        self.log_weight_s.data.copy_(target.log())
 
     def set_trainable(self, enabled: bool) -> None:
         self.weight.requires_grad = enabled
