@@ -2,6 +2,7 @@ import argparse
 import copy
 import math
 import torch
+from torch.nn.utils import clip_grad_norm_
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,10 +23,10 @@ class Config:
     batch_size: int = 8
     seq_len: int = 512
     lr: float = 5e-6
-    device: str = "cuda"
+    device: str = "cpu"
     dtype: str = "float32"
-    base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    # base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    # base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
     dataset_ratio_a: float = 0.75
@@ -190,9 +191,10 @@ def load_checkpoint(
     model: LlamaForCausalLM,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    map_location: torch.device | str | None = None,
 ) -> None:
     """Load checkpoint into model (must already have QuantLinear modules)."""
-    ckpt = torch.load(checkpoint_path, weights_only=False)
+    ckpt = torch.load(checkpoint_path, weights_only=False, map_location=map_location)
     model.load_state_dict(ckpt["model"])
     if optimizer is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -304,6 +306,7 @@ def run(cfg: Config) -> None:
             student_ce_total += student_ce.item()
             teacher_ce_total += teacher_ce.item()
 
+        # clip_grad_norm_(student.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
 

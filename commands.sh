@@ -19,6 +19,18 @@ pyhon -m a40.eval
 
 
 
+
+# Eval
+python -m a40.eval --checkpoint-step 1000 --train-layers 2,8,15 --batch-size 8 --seq-len 512 --tasks gsm8k
+
+
+
+
+
+
+
+
+
 # ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJCfdt1bZQlcOOxKQAsNCZy50c/OrOdwnXXXIbho6dnf h200
 # -----BEGIN OPENSSH PRIVATE KEY-----
 # b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW

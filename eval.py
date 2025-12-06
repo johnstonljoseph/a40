@@ -18,11 +18,10 @@ from .main import (
 )
 
 
-_lm_eval_root = Path(lm_eval.__file__).resolve().parents[1]
-git_dir = _lm_eval_root / ".git"
-if git_dir.exists():
-    os.environ.setdefault("GIT_WORK_TREE", str(_lm_eval_root))
-    os.environ.setdefault("GIT_DIR", str(git_dir))
+# Default location for stored training checkpoints
+DEFAULT_CHECKPOINTS_DIR = Path(
+    "/Users/joseph/Library/CloudStorage/GoogleDrive-johnstonljoseph@gmail.com/My Drive/a40/checkpoints"
+)
 
 
 def extract_basic_metrics(results: Mapping[str, Mapping[str, float]]) -> dict[str, float]:
@@ -55,18 +54,23 @@ def parse_train_layers(raw: str) -> tuple[int, ...]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a quantized checkpoint via lm_eval.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint.pt to load.")
+    parser.add_argument(
+        "--checkpoints-dir",
+        type=str,
+        default=str(DEFAULT_CHECKPOINTS_DIR),
+        help="Directory containing checkpoint files (step_<n>.pt).",
+    )
+    parser.add_argument(
+        "--checkpoint-step",
+        type=int,
+        default=1000,
+        help="Training step whose checkpoint should be evaluated.",
+    )
     parser.add_argument(
         "--train-layers",
         type=str,
         required=True,
         help="Comma-separated decoder layer indices that were quantized (e.g. 0,1,2).",
-    )
-    parser.add_argument(
-        "--weight-scale-dir",
-        type=str,
-        required=True,
-        help="Directory containing per-layer scale files from weight_calibration.",
     )
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--seq-len", type=int, default=Config.seq_len)
@@ -79,38 +83,45 @@ def parse_args() -> argparse.Namespace:
         default=["gsm8k", "truthfulqa_mc1"],
         help="Whitespace-separated lm_eval task names.",
     )
-    parser.add_argument("--num-fewshot", type=int, default=0)
-    parser.add_argument("--limit", type=float, default=0.001, help="Optional fraction per task (e.g., 0.01).")
+    parser.add_argument("--num-fewshot", type=int, default=5)
+    parser.add_argument("--limit", type=float, default=0.05, help="Optional fraction per task (e.g., 0.01).")
     parser.add_argument("--output", type=str, default="eval_results.json")
     args = parser.parse_args()
     args.train_layers = parse_train_layers(args.train_layers)
+    checkpoints_dir = Path(args.checkpoints_dir).expanduser()
+    args.checkpoint_path = checkpoints_dir / f"step_{args.checkpoint_step}.pt"
     return args
 
 
 def load_teacher(args: argparse.Namespace):
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
-    resolved = resolve_model_path(path)
+    resolved = resolve_model_path(Config.base_path)
     return load_model(resolved, device, dtype)
 
 
 def load_student(args: argparse.Namespace, teacher: torch.nn.Module):
     model = copy.deepcopy(teacher)
+    print("  Hydrating...")
     hydrate_with_quant(
         model,
         args.train_layers,
-        weight_scale_dir=args.weight_scale_dir,
+        hydrate_fresh_non_weight_params=False,
     )
-    load_checkpoint(args.checkpoint, model)
+    print("  Loading checkpoint...")
+    load_checkpoint(str(args.checkpoint_path), model, map_location=args.device)
     return model
 
 
 def main():
     args = parse_args()
+    print("Loading teacher...")
     teacher = load_teacher(args)
-    student = load_student(teacher)
+    print("Loading student...")
+    student = load_student(args, teacher)
 
     with torch.no_grad():
+        print("Evaluating teacher...")
         teacher_results = lm_eval.simple_evaluate(
             model=HFLM(pretrained=teacher, batch_size=args.batch_size),
             model_args=None,
@@ -119,6 +130,7 @@ def main():
             num_fewshot=args.num_fewshot,
             limit=args.limit,
         )
+        print("Evaluating student...")
         student_results = lm_eval.simple_evaluate(
             model=HFLM(pretrained=student, batch_size=args.batch_size),
             model_args=None,
@@ -128,7 +140,7 @@ def main():
             limit=args.limit,
         )
 
-    print("== student ==")
+    print("\n== student ==")
     print_results(student_results)
     print("\n== teacher ==")
     print_results(teacher_results)
@@ -143,6 +155,7 @@ def main():
         "student": student_results,
         "teacher": teacher_results,
     }
+    print("\nSaving results to", args.output)
     with open(args.output, "w") as f:
         json.dump(payload, f, indent=2, default=_json_default)
 
