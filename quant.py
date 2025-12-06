@@ -2,7 +2,15 @@ import torch
 import math
 import torch.nn.functional as F
 import torch.nn as nn
-from tqdm.auto import tqdm
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ActivationCalibration:
+    batch_size: int = 1
+    seq_len: int = 1
+    sample_count: int = 1
+    percentile: float = 0.9999
 
 
 def sum_like(tensor, s_shape) -> torch.Tensor:
@@ -64,11 +72,8 @@ class QuantLinear(nn.Module):
         self,
         in_features,
         out_features,
-        batch_size: int,
-        seq_len: int,
         bits: int = 8,
-        sample_count: int = 1,
-        percentile: float = 0.9999,
+        act_calib: ActivationCalibration | None = None,
     ):
         super().__init__()
         self.qmax = 1 << (bits - 1)
@@ -77,135 +82,44 @@ class QuantLinear(nn.Module):
         self.log_act_s = nn.Parameter(torch.zeros(()))
         self.log_weight_s = nn.Parameter(torch.empty(out_features, 1))
 
-        self.percentile = percentile
-        self.sample_count = sample_count
-        self.samples_collected = 0
-        self.batch_size = batch_size
-        self.seq_len = seq_len
-        self.register_buffer(
-            "act_samples",
-            torch.empty(sample_count, batch_size, seq_len, in_features),
-        )
+        self.act_calib = act_calib
+        if act_calib is not None:
+            self.samples_collected = 0
+            self.register_buffer(
+                "act_samples",
+                torch.empty(act_calib.sample_count, act_calib.batch_size, act_calib.seq_len, in_features),
+                persistent=False,
+            )
+            self.set_trainable(False)
+
+        
 
     def forward(self, x):
-        if self.samples_collected < self.sample_count:
+        if self.act_calib is not None and self.samples_collected < self.act_calib.sample_count:
             with torch.no_grad():
                 sample = x.detach().to(dtype=self.act_samples.dtype)
                 self.act_samples[self.samples_collected].copy_(sample)
                 self.samples_collected += 1
-                if self.samples_collected == self.sample_count:
+                if self.samples_collected == self.act_calib.sample_count:
                     flat = self.act_samples.abs().flatten().to("cpu", dtype=torch.float32)
-                    act_s = torch.quantile(flat, self.percentile)
+                    act_s = torch.quantile(flat, self.act_calib.percentile)
                     self.log_act_s.copy_(act_s.log())
+                    self.set_trainable(True)
             return F.linear(x, self.weight)
 
         x_q = QuantFn.apply(x, self.log_act_s.exp(), self.qmax)
         w_q = QuantFn.apply(self.weight, self.log_weight_s.exp(), self.qmax)
         return F.linear(x_q, w_q)
 
-    def initialize(self, linear: nn.Linear, *, show_progress: bool = False, desc: str | None = None) -> None:
-        with torch.no_grad():
-            if self.weight.data_ptr() != linear.weight.data_ptr():
-                self.weight.copy_(linear.weight)
-
-            b = float(self.qmax) - 0.5
-            rows = self.weight
-            progress = tqdm(
-                total=rows.shape[0],
-                desc=desc or "calibrating scales",
-                leave=False,
-            )
-
-            scales = []
-            for row in rows:
-                per_row_max = row.abs().max().clamp_min(1e-12)
-                scale = per_row_max / b
-                scales.append(scale)
-                # scales.append(solve_silq_scale(row.abs(), b))
-                progress.update(1)
-
-            progress.close()
-
-            self.log_weight_s.copy_(torch.stack(scales).unsqueeze(1).log())
-
     def set_weight_scales(self, scales: torch.Tensor) -> None:
         if scales.dim() != 1:
-            raise ValueError("Expected scales with shape [out_features]")
+            raise ValueError()
         target = scales.view(-1, 1).to(dtype=self.log_weight_s.dtype, device=self.log_weight_s.device)
-        self.log_weight_s.data.copy_(target.log())
+        with torch.no_grad():
+            self.log_weight_s.copy_(target.log())
 
     def set_trainable(self, enabled: bool) -> None:
         self.weight.requires_grad = enabled
         self.log_weight_s.requires_grad = enabled
         self.log_act_s.requires_grad = enabled
             
-
-def solve_silq_scale(row_abs: torch.Tensor, b: float) -> torch.Tensor:
-    """
-    Return the SiLQ step size s that minimizes
-
-        F(s) = sum_i max(s^2/12, H(|w_i| - s*b) * (|w_i| - s*b)^2)
-
-    for a single channel (1D tensor of magnitudes).
-    """
-    orig_dtype = row_abs.dtype
-    device = row_abs.device
-
-    # Work in float64
-    work = row_abs.abs().to(torch.float64)
-    n = work.numel()
-
-    # Sort |w| descending and compute prefix sums:
-    # sorted_vals[0] is largest |w|, prefix[k] = sum of top k magnitudes
-    sorted_vals, _ = torch.sort(work, descending=True)
-    prefix = torch.cat([sorted_vals.new_zeros(1), sorted_vals.cumsum(0)])  # len n+1
-
-    # k = number of “clipped” / outer-branch weights (0..n)
-    idx_long = torch.arange(n + 1, device=device, dtype=torch.long)
-    k = idx_long.to(torch.float64)
-
-    # For a fixed k, assuming top-k are in the outer quadratic and others inside,
-    # derivative root is:
-    #   s_k = (2 b * sum_{i=1..k} |w|_(i)) / ((n - k)/6 + 2 b^2 k)
-    denom = (n - k) / 6.0 + 2.0 * (b ** 2) * k
-    valid = denom > 0
-    num = 2.0 * b * prefix[idx_long]
-    safe_div = torch.where(valid, num / denom, torch.zeros_like(denom))
-    s_from_k = safe_div
-    # Keep only positive stationary points (avoid boolean indexing for vmap)
-    s_stationary = torch.where(s_from_k > 0, s_from_k, torch.zeros_like(s_from_k))
-
-    # Hinge breakpoints: where (|w| - s*b)^2 = s^2/12 and diff > 0
-    # => |w| = s * (b + 1/sqrt(12)) => s = |w| / (b + 1/sqrt(12))
-    inv_sqrt12 = 1.0 / math.sqrt(12.0)
-    clip_den = b + inv_sqrt12
-    if clip_den > 0:
-        thresholds = sorted_vals / clip_den
-        # Only care about positive thresholds
-        thresholds = thresholds[thresholds > 0]
-    else:
-        thresholds = work.new_empty(0)
-
-    # Always include a tiny positive epsilon near 0 as boundary candidate
-    eps = work.new_tensor([1e-12])
-
-    # Candidate pool: stationary points + hinge breakpoints + epsilon
-    if s_stationary.numel() == 0 and thresholds.numel() == 0:
-        candidate_pool = eps
-    else:
-        candidate_pool = torch.cat([s_stationary, thresholds, eps])
-
-    # Evaluate the *true* loss for all candidates (vectorized)
-    def _loss_batch(s_vals: torch.Tensor) -> torch.Tensor:
-        s = s_vals.view(-1, 1)  # [M, 1]
-        diff = work - s * b     # [M, n]
-        inside = (s * s) / 12.0 # [M, 1]
-        outside = torch.relu(diff).square()
-        return torch.maximum(inside, outside).sum(dim=1)  # [M]
-
-    candidate_pool = candidate_pool.clamp_min(1e-12)
-    losses = _loss_batch(candidate_pool)
-    best_idx = torch.argmin(losses)
-    s_best = candidate_pool[best_idx]
-
-    return s_best.clamp_min(1e-12).to(orig_dtype)

@@ -1,9 +1,24 @@
 import argparse
+import importlib
+import sys
 from pathlib import Path
+from tqdm.auto import tqdm
+from .solve import solve
 
 import torch
 
-from .main import Config, load_model, resolve_model_path, _iter_layer_linears
+# Script is run via `python -m weight_calibration.main` from the a40 directory.
+# Make sure the parent directory (which contains the `a40` namespace) is on sys.path
+# so we can import `a40.main` and reuse its utilities.
+repo_root = Path(__file__).resolve().parents[1]
+project_parent = repo_root.parent
+if str(project_parent) not in sys.path:
+    sys.path.insert(0, str(project_parent))
+main_module = importlib.import_module(f"{repo_root.name}.main")
+Config = main_module.Config  # type: ignore[attr-defined]
+_iter_layer_linears = main_module._iter_layer_linears  # type: ignore[attr-defined]
+load_model = main_module.load_model  # type: ignore[attr-defined]
+resolve_model_path = main_module.resolve_model_path  # type: ignore[attr-defined]
 
 
 def parse_args() -> argparse.Namespace:
@@ -15,7 +30,7 @@ def parse_args() -> argparse.Namespace:
         help="Path (or HF snapshot dir) to the model to calibrate.",
     )
     parser.add_argument(
-        "--train-layers",
+        "--layers",
         type=str,
         required=True,
         help="Comma-separated decoder layer indices to process (e.g. 0,1,2).",
@@ -45,25 +60,28 @@ def parse_args() -> argparse.Namespace:
         help="Torch dtype to load the model with (e.g., float32, bfloat16).",
     )
     args = parser.parse_args()
-    raw_layers = args.train_layers.strip()
-    if not raw_layers:
-        raise ValueError("--train-layers requires at least one integer index")
-    try:
-        layer_ids = tuple(int(tok) for tok in raw_layers.split(",") if tok.strip())
-    except ValueError as exc:
-        raise ValueError("--train-layers must be a comma-separated list of integers") from exc
-    if not layer_ids:
-        raise ValueError("--train-layers requires at least one integer index")
-    args.layer_ids = layer_ids
+    raw_layers = args.layers.strip()
+    args.layer_ids = tuple(int(tok) for tok in raw_layers.split(",") if tok.strip())
     return args
 
 
 @torch.no_grad()
-def compute_scales(weight: torch.Tensor, qmax: int) -> torch.Tensor:
+def solve_scales(weight: torch.Tensor, qmax: int) -> torch.Tensor:
     """Match QuantLinear.initialize(): per-row max divided by (qmax - 0.5)."""
+
+    progress = tqdm(
+        total=weight.shape[0],
+        leave=False,
+    )
+
     b = float(qmax) - 0.5
-    per_row_max = weight.abs().amax(dim=1).clamp_min(1e-12)
-    return per_row_max / b
+    scales = []
+    for row in weight:
+        scales.append(solve(row.abs(), b))
+        progress.update(1)
+    progress.close()
+
+    return torch.stack(scales)
 
 
 def main():
@@ -81,25 +99,21 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     total_written = 0
-    for layer_index, _, name, child in _iter_layer_linears(model.model.layers):
+    for layer_index, _parent, name, child in _iter_layer_linears(model.model.layers):
         if layer_index not in args.layer_ids:
             continue
-        scales = compute_scales(child.weight.detach(), qmax).cpu()
+        print(f"[calib] solving {name} (layer {layer_index})...", flush=True)
+        scales = solve_scales(child.weight.detach(), qmax).cpu()
+        layer_dir = output_dir / str(layer_index)
+        layer_dir.mkdir(parents=True, exist_ok=True)
         payload = {
-            "layer": layer_index,
-            "name": name,
             "bits": args.bits,
             "scales": scales,
         }
-        path = output_dir / f"layer{layer_index}_{name}.pt"
+        path = layer_dir / f"{name}.pt"
         torch.save(payload, path)
         total_written += 1
         print(f"[calib] wrote {path} ({scales.numel()} values)")
 
-    if total_written == 0:
-        raise ValueError("No layers matched --train-layers; nothing was written.")
     print(f"[calib] completed: {total_written} files in {output_dir}")
 
-
-if __name__ == "__main__":
-    main()

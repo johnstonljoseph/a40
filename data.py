@@ -59,20 +59,19 @@ def format_to_text(example: Dict[str, Any], tokenizer: PreTrainedTokenizerBase) 
     return {"text": ""}
 
 
+def _has_text(example: Dict[str, Any]) -> bool:
+    text = example.get("text")
+    return isinstance(text, str) and bool(text.strip())
+
+
 def build_dataloader(cfg: "Config", tokenizer_path: str) -> DataLoader:
     print(f"[data] loading tokenizer from {tokenizer_path}", flush=True)
-    template_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
-
-    def map_fn(example):
-        return format_to_text(example, template_tokenizer)
-
-    def has_text(example: Dict[str, Any]) -> bool:
-        return bool(example.get("text").strip())
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
 
     ds_a = (
         datasets.load_dataset(cfg.dataset_a, split="train", streaming=True)
-        .map(map_fn)
-        .filter(has_text)
+        .map(format_to_text, fn_kwargs={"tokenizer": tokenizer})
+        .filter(_has_text)
         .repeat(None)
     )
     print(f"[data] dataset A ready", flush=True)
@@ -93,12 +92,12 @@ def build_dataloader(cfg: "Config", tokenizer_path: str) -> DataLoader:
         seed=cfg.seed,
     ).shuffle(buffer_size=cfg.shuffle_buffer_size, seed=cfg.seed)
 
-    print("[data] packing tokens into sequences", flush=True)
+    print("[data] packing tokens", flush=True)
     iterable = PackedStreamingDataset(repeated_stream, tokenizer_path, cfg.seq_len)
     print("[data] dataloader ready", flush=True)
     return DataLoader(
         iterable,
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
-        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+        # prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
     )

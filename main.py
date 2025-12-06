@@ -1,34 +1,30 @@
 import argparse
+import copy
 import math
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 from transformers import LlamaForCausalLM
 from tqdm.auto import tqdm
 
-from .eval import evaluate_model, extract_basic_metrics
-from .quant import QuantLinear
+from .quant import ActivationCalibration, QuantLinear
 from .data import build_dataloader
-
-
-class ConfigDefaults:
-    eval_tasks: tuple[str, ...] = ("gsm8k", "truthfulqa_mc1", "ifeval")
 
 
 @dataclass
 class Config:
-    steps: int = 1
+    steps: int = 10
     grad_accum_steps: int = 1
     batch_size: int = 1
     seq_len: int = 16
-    device: str = "cuda"
-    # CPU loads are faster in float32 even if the base checkpoint ships bf16 weights.
-    dtype: str = "float32"
-    student_model_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    teacher_model_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     lr: float = 5e-6
+    device: str = "cuda"
+    dtype: str = "float32"
+    # student_model_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    # teacher_model_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6"
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
     dataset_split: str = "train"
@@ -36,52 +32,17 @@ class Config:
     shuffle_buffer_size: int = 10_000
     seed: int = 0
     num_workers: int = 1
-    prefetch_factor: int = 2
-    log_interval: int = 3
-    checkpoint_interval: int = 500
-    eval_interval: int = 500
+    checkpoint_interval: int = 5
     checkpoint_dir: str = "checkpoints"
-    resume_from: str = ""  # path to checkpoint.pt to resume from
-    eval_tasks: List[str] = field(default_factory=lambda: list(ConfigDefaults.eval_tasks))
-    train_layers: tuple[int, ...] = field(default_factory=tuple)  # decoder layer indices to update
-    eval_limit: Optional[float] = None  # fraction of eval dataset per task
-    weight_scale_dir: str = ""  # optional directory with precomputed weight scales
+    resume_step: Optional[int] = None  # Step number to resume from (checks checkpoint_dir).
+    train_layers: tuple[int, ...] = field(default_factory=tuple)  # Decoder layer indices to update.
+    weight_scale_dir: str = ""  # Optional directory with precomputed weight scales.
 
 
 def parse_args() -> Config:
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=Config.steps)
     parser.add_argument("--batch-size", dest="batch_size", type=int, default=Config.batch_size)
-    parser.add_argument(
-        "--train-layers",
-        type=str,
-        required=True,
-        help="Comma-separated decoder layer indices to finetune",
-    )
-    parser.add_argument(
-        "--checkpoint-interval",
-        type=int,
-        default=Config.checkpoint_interval,
-        help="Save a checkpoint every N steps (0 to disable)",
-    )
-    parser.add_argument(
-        "--eval-interval",
-        type=int,
-        default=Config.eval_interval,
-        help="Run evaluation every N steps (0 to disable)",
-    )
-    parser.add_argument(
-        "--eval-tasks",
-        type=str,
-        default=",".join(ConfigDefaults.eval_tasks),
-        help="Comma-separated lm_eval task names (must be non-script datasets)",
-    )
-    parser.add_argument(
-        "--log-interval",
-        type=int,
-        default=Config.log_interval,
-        help="Update progress bar metrics every N steps",
-    )
     parser.add_argument(
         "--seq-len",
         dest="seq_len",
@@ -90,17 +51,10 @@ def parse_args() -> Config:
         help="Sequence length for packed training batches",
     )
     parser.add_argument(
-        "--resume-from",
+        "--train-layers",
         type=str,
-        default=Config.resume_from,
-        help="Path to checkpoint.pt to resume from",
-    )
-    parser.add_argument(
-        "--eval-limit",
-        dest="eval_limit",
-        type=float,
-        default=None,
-        help="Optional fraction of eval examples per task (e.g., 0.01)",
+        required=True,
+        help="Comma-separated decoder layer indices to finetune",
     )
     parser.add_argument(
         "--weight-scale-dir",
@@ -108,34 +62,44 @@ def parse_args() -> Config:
         default=Config.weight_scale_dir,
         help="Directory containing per-layer weight scale files (optional)",
     )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=Config.checkpoint_interval,
+        help="Save a checkpoint every N steps (0 to disable)",
+    )
+    parser.add_argument(
+        "--resume-step",
+        type=int,
+        default=Config.resume_step,
+        help="Step number to resume from (loads checkpoints/step_<N>/checkpoint.pt).",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=Config.device,
+        help="Device to run distillation on (e.g., cuda or cpu).",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default=Config.dtype,
+        help="Torch dtype for loading models (e.g., float32, bfloat16).",
+    )
     args = parser.parse_args()
     raw_train_layers = args.train_layers.strip()
-    if not raw_train_layers:
-        raise ValueError("--train-layers requires at least one integer index")
-    try:
-        train_layers = tuple(int(tok) for tok in raw_train_layers.split(",") if tok.strip())
-    except ValueError as exc:
-        raise ValueError("--train-layers must be a comma-separated list of integers") from exc
-    if not train_layers:
-        raise ValueError("--train-layers requires at least one integer index")
-    eval_tasks = tuple(
-        task.strip()
-        for task in args.eval_tasks.split(",")
-        if task.strip()
-    ) or tuple(Config.eval_tasks)
-
+    train_layers = tuple(int(tok) for tok in raw_train_layers.split(",") if tok.strip())
     return Config(
         steps=args.steps,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         train_layers=train_layers,
         checkpoint_interval=args.checkpoint_interval,
-        eval_interval=args.eval_interval,
         log_interval=args.log_interval,
-        eval_tasks=list(eval_tasks),
-        resume_from=args.resume_from,
-        eval_limit=args.eval_limit,
+        resume_step=args.resume_step,
         weight_scale_dir=args.weight_scale_dir,
+        device=args.device,
+        dtype=args.dtype,
     )
 
 
@@ -154,6 +118,14 @@ def resolve_model_path(path_str: str) -> str:
     raise FileNotFoundError(
         f"Model path {path} not found. Expected a HF snapshot dir or concrete model folder."
     )
+
+
+def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> LlamaForCausalLM:
+    model = LlamaForCausalLM.from_pretrained(model_path, dtype=dtype)
+    model.config.use_cache = False
+    model.eval()
+    model = model.to(device)
+    return model
 
 
 def compute_kl_loss(
@@ -188,14 +160,6 @@ def compute_token_cross_entropy(
     return (loss * shift_mask).sum() / mask_sum
 
 
-def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> LlamaForCausalLM:
-    model = LlamaForCausalLM.from_pretrained(model_path, dtype=dtype)
-    model.config.use_cache = False
-    model.eval()
-    model = model.to(device)
-    return model
-
-
 def freeze(model: torch.nn.Module) -> None:
     for param in model.parameters():
         param.requires_grad = False
@@ -219,37 +183,31 @@ def _iter_layer_linears(layers: Sequence[torch.nn.Module]):
 def swap_linear_with_quant(
     module: torch.nn.Module,
     train_layers: tuple[int, ...],
-    *,
-    batch_size: int,
-    seq_len: int,
-    weight_scale_dir: str = "",
+    weight_scale_dir: str,
+    activation_calibration: ActivationCalibration | None = None,
 ) -> None:
-    scale_dir = Path(weight_scale_dir).expanduser() if weight_scale_dir else None
+    scale_dir = Path(weight_scale_dir).expanduser()
     for layer_index, parent, name, child in _iter_layer_linears(module.model.layers):
         if layer_index not in train_layers:
             continue
         quant = QuantLinear(
             child.in_features,
             child.out_features,
-            batch_size=batch_size,
-            seq_len=seq_len,
+            activation_calibration,
         )
-        quant.weight = child.weight
-        used_scales = False
-        if scale_dir:
-            scale_path = scale_dir / f"layer{layer_index}_{name}.pt"
-            if scale_path.exists():
-                loaded = torch.load(scale_path, map_location="cpu")
-                if isinstance(loaded, dict) and "scales" in loaded:
-                    loaded = loaded["scales"]
-                quant.set_weight_scales(torch.as_tensor(loaded))
-                used_scales = True
-                print(f"[quant] loaded scales from {scale_path}")
-        if not used_scales:
-            quant.initialize(child, show_progress=True, desc=f"scales:{name}")
-        quant.to(child.weight.device)
-        quant.set_trainable(True)
         setattr(parent, name, quant)
+        quant.weight = child.weight
+        quant.to(child.weight.device)
+        scale_path = scale_dir / f"{layer_index}" / f"{name}.pt"
+        if not scale_path.exists():
+            raise FileNotFoundError(
+                f"Missing scale file for layer {layer_index} ({name}) at {scale_path}. "
+                "Ensure --train-layers matches the directories under the weight scale folder."
+            )
+        payload = torch.load(scale_path, map_location="cpu")
+        if payload.get("bits") != 8:
+            raise ValueError()
+        quant.set_weight_scales(payload.get("scales"))
 
 
 def save_checkpoint(
@@ -290,64 +248,66 @@ def load_checkpoint(
     return ckpt["step"]
 
 
-def evaluate(model: LlamaForCausalLM, cfg: Config) -> dict:
-    results = evaluate_model(
-        model,
-        tasks=cfg.eval_tasks,
-        batch_size=cfg.batch_size,
-        limit=cfg.eval_limit,
-    )
-    metrics = extract_basic_metrics(results.get("results", {}))
-    for task, acc in metrics.items():
-        print(f"  {task}: {acc:.4f}")
-    return metrics
+def _checkpoint_path(checkpoint_dir: str, step: int) -> Path:
+    return Path(checkpoint_dir) / f"step_{step}" / "checkpoint.pt"
 
 
 def run(cfg: Config) -> None:
     device = torch.device(cfg.device)
     dtype = getattr(torch, cfg.dtype)
 
-    print("Resolving model paths...", flush=True)
-    student_path = resolve_model_path(cfg.student_model_path)
-    teacher_path = resolve_model_path(cfg.teacher_model_path)
+    print("[run] resolving model paths...", flush=True)
+    base_path = resolve_model_path(cfg.base_model_path)
 
-    print("Loading student model...", flush=True)
-    student = load_model(student_path, device, dtype)
-    freeze(student)
-    swap_linear_with_quant(
-        student,
-        cfg.train_layers,
-        batch_size=cfg.batch_size,
-        seq_len=cfg.seq_len,
-        weight_scale_dir=cfg.weight_scale_dir,
-    )
-
-    print("Loading teacher model...", flush=True)
-    teacher = load_model(teacher_path, device, dtype)
+    print("[run] loading teacher model...", flush=True)
+    teacher = load_model(base_path, device, dtype)
     freeze(teacher)
+
+    print("[run] cloning student model...", flush=True)
+    student = copy.deepcopy(teacher)
+
+    start_step = 0
+    if cfg.resume_step is None:
+        act_calib = ActivationCalibration(
+            batch_size=cfg.batch_size,
+            seq_len=cfg.seq_len,
+        )
+        swap_linear_with_quant(
+            student,
+            cfg.train_layers,
+            act_calib,
+            cfg.weight_scale_dir,
+        )
+
+    else:
+        swap_linear_with_quant(
+            student,
+            cfg.train_layers,
+            cfg.weight_scale_dir,
+        )
+        ckpt_path = _checkpoint_path(cfg.checkpoint_dir, cfg.resume_step)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint for step {cfg.resume_step} not found at {ckpt_path}")
+        start_step = load_checkpoint(str(ckpt_path), student, optimizer, scheduler)
+        print(f"[run] resumed from step {start_step}")
+
 
     optimizer = torch.optim.AdamW(student.parameters(), lr=cfg.lr, weight_decay=0.1)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.steps, eta_min=cfg.lr * 0.1
     )
 
-    start_step = 0
-    if cfg.resume_from:
-        start_step = load_checkpoint(cfg.resume_from, student, optimizer, scheduler)
-        print(f"Resumed from step {start_step}")
-
-    print("Building dataloader...", flush=True)
-    batch_iter = iter(build_dataloader(cfg, student_path))
+    batch_iter = iter(build_dataloader(cfg, base_path))
 
     progress = tqdm(
         range(start_step, cfg.steps),
         initial=start_step,
         total=cfg.steps,
         desc="distill",
+        bar_format="{desc}: |{bar}| {n_fmt}/{total_fmt}{postfix}",
     )
 
     for step in progress:
-        print(f"[step {step + 1}/{cfg.steps}] starting", flush=True)
         optimizer.zero_grad()
 
         kl_total = 0.0
@@ -385,20 +345,13 @@ def run(cfg: Config) -> None:
         student_ppl = math.exp(avg_student_ce)
         teacher_ppl = math.exp(avg_teacher_ce)
 
-        if step % cfg.log_interval == 0 or step == cfg.steps - 1:
-            progress.set_postfix(
-                kl_loss=f"{kl_total:.6f}",
-                student_ppl=f"{student_ppl:.2f}",
-                teacher_ppl=f"{teacher_ppl:.2f}",
-            )
+        progress.set_postfix_str(
+            f"[kl_loss={kl_total:.6f}, student_ppl={student_ppl:.2f}, teacher_ppl={teacher_ppl:.2f}]"
+        )
 
         if cfg.checkpoint_interval > 0 and (step + 1) % cfg.checkpoint_interval == 0:
             save_checkpoint(student, optimizer, scheduler, step + 1, cfg)
-
-        if cfg.eval_interval > 0 and (step + 1) % cfg.eval_interval == 0:
-            print(f"Evaluating at step {step + 1}...")
-            evaluate(student, cfg)
-
+            
 
 def main() -> None:
     cfg = parse_args()

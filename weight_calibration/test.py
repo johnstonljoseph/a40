@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 import pytest
 
-import quant
+from .solve import solve 
 
 
-def silq_loss(row_abs: torch.Tensor, b: float, s: torch.Tensor) -> torch.Tensor:
+def loss(row_abs: torch.Tensor, b: float, s: torch.Tensor) -> torch.Tensor:
     """Autograd-friendly SiLQ objective."""
     inside = (s * s) / 12.0
     outside = torch.relu(row_abs - s * b).square()
@@ -18,7 +18,7 @@ def optimize_s_with_grad(row_abs: torch.Tensor, b: float, steps: int = 400, lr: 
     opt = torch.optim.Adam([s], lr=lr)
     for _ in range(steps):
         opt.zero_grad()
-        loss = silq_loss(row_abs, b, s)
+        loss = loss(row_abs, b, s)
         loss.backward()
         opt.step()
         with torch.no_grad():
@@ -29,7 +29,7 @@ def optimize_s_with_grad(row_abs: torch.Tensor, b: float, steps: int = 400, lr: 
 def test_solve_silq_scale_matches_backprop_optimum(num_weights, b=16-0.5):
     torch.manual_seed(0)
     row_abs = torch.randn(num_weights, dtype=torch.float32).abs()
-    solved = quant.solve_silq_scale(row_abs, b)
+    solved = solve(row_abs, b)
     optimized = optimize_s_with_grad(row_abs, b)
     assert torch.allclose(solved, optimized, rtol=1e-2, atol=1e-4)
 

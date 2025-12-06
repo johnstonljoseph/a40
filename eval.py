@@ -1,37 +1,28 @@
 import argparse
+import copy
 import json
 import os
 from pathlib import Path
 from typing import Mapping, Sequence
 
-import lm_eval  # pip install lm-eval
+import torch
+import lm_eval
 from lm_eval.models.huggingface import HFLM
 
+from .main import (
+    Config,
+    load_checkpoint,
+    load_model,
+    resolve_model_path,
+    swap_linear_with_quant,
+)
+
+
 _lm_eval_root = Path(lm_eval.__file__).resolve().parents[1]
-os.environ.setdefault("GIT_WORK_TREE", str(_lm_eval_root)); os.environ.setdefault("GIT_DIR", str(_lm_eval_root / ".git"))
-
-
-def evaluate_model(
-    model_or_name,
-    *,
-    tasks: Sequence[str],
-    batch_size: int,
-    num_fewshot: int = 0,
-    limit: float | None = None,
-    model_args: str | None = None,
-):
-    if not isinstance(model_or_name, str):
-        model_or_name = HFLM(pretrained=model_or_name, batch_size=batch_size)
-        model_args = None
-
-    return lm_eval.simple_evaluate(
-        model=model_or_name,
-        model_args=model_args,
-        tasks=tasks,
-        batch_size=batch_size,
-        num_fewshot=num_fewshot,
-        limit=limit,
-    )
+git_dir = _lm_eval_root / ".git"
+if git_dir.exists():
+    os.environ.setdefault("GIT_WORK_TREE", str(_lm_eval_root))
+    os.environ.setdefault("GIT_DIR", str(git_dir))
 
 
 def extract_basic_metrics(results: Mapping[str, Mapping[str, float]]) -> dict[str, float]:
@@ -55,70 +46,112 @@ def print_results(results: Mapping[str, dict]) -> None:
         print("\nAggregated metrics not provided for this run.")
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def parse_train_layers(raw: str) -> tuple[int, ...]:
+    values = tuple(int(tok) for tok in raw.split(",") if tok.strip())
+    if not values:
+        raise ValueError("--train-layers requires at least one integer index")
+    return values
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a quantized checkpoint via lm_eval.")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint.pt to load.")
     parser.add_argument(
-        "--model",
+        "--teacher-path",
         type=str,
-        default="hf",
-        help='lm-eval model type, e.g. "hf", "vllm", "openai"',
+        default=Config.teacher_path,
+        help="Teacher model path or HF snapshot directory.",
     )
     parser.add_argument(
-        "--model_args",
+        "--train-layers",
         type=str,
         required=True,
-        help=(
-            'lm-eval model_args string, e.g. '
-            '"pretrained=meta-llama/Meta-Llama-3-8B-Instruct,device=cuda:0,trust_remote_code=True"'
-        ),
+        help="Comma-separated decoder layer indices that were quantized (e.g. 0,1,2).",
     )
     parser.add_argument(
-        "--output",
+        "--weight-scale-dir",
         type=str,
-        default="leaderboard_results.json",
-        help="Where to save the aggregated results JSON",
+        required=True,
+        help="Directory containing per-layer scale files from weight_calibration.",
     )
-    parser.add_argument(
-        "--limit",
-        type=float,
-        default=None,
-        help="Optional fraction of examples per task for quick debug, e.g. 0.01",
-    )
+    parser.add_argument("--batch-size", type=int, default=Config.batch_size)
+    parser.add_argument("--seq-len", type=int, default=Config.seq_len)
+    parser.add_argument("--device", type=str, default=Config.device)
+    parser.add_argument("--dtype", type=str, default=Config.dtype)
     parser.add_argument(
         "--tasks",
         type=str,
         nargs="+",
-        default=["gsm8k", "mmlu_pro", "gpqa_main"],
-        help="Whitespace-separated lm-eval task names (e.g. gsm8k truthfulqa_mc1).",
+        default=["gsm8k", "truthfulqa_mc1"],
+        help="Whitespace-separated lm_eval task names.",
     )
-    parser.add_argument(
-        "--batch-size",
-        dest="batch_size",
-        type=int,
-        default=1,
-        help="Per-device batch size passed through to lm-eval.",
-    )
-    parser.add_argument(
-        "--num_fewshot",
-        type=int,
-        default=0,
-        help="Few-shot examples to use (Open LLM LB typically uses 0 or small n).",
-    )
+    parser.add_argument("--num-fewshot", type=int, default=0)
+    parser.add_argument("--limit", type=float, default=0.001, help="Optional fraction per task (e.g., 0.01).")
+    parser.add_argument("--output", type=str, default="eval_results.json")
     args = parser.parse_args()
+    args.train_layers = parse_train_layers(args.train_layers)
+    return args
 
-    results = run_evaluation(
-        args.model,
-        model_args=args.model_args,
-        tasks=args.tasks,
-        num_fewshot=args.num_fewshot,
-        limit=args.limit,
-        batch_size=args.batch_size,
+
+def load_teacher(args: argparse.Namespace):
+    device = torch.device(args.device)
+    dtype = getattr(torch, args.dtype)
+    resolved = resolve_model_path(path)
+    return load_model(resolved, device, dtype)
+
+
+def load_student(args: argparse.Namespace, teacher: torch.nn.Module):
+    model = copy.deepcopy(teacher)
+    swap_linear_with_quant(
+        model,
+        args.train_layers,
+        weight_scale_dir=args.weight_scale_dir,
     )
+    load_checkpoint(args.checkpoint, model)
+    return model
 
-    print_results(results)
 
+def main():
+    args = parse_args()
+    teacher = load_teacher(args)
+    student = load_student(teacher)
+
+    with torch.no_grad():
+        teacher_results = lm_eval.simple_evaluate(
+            model=HFLM(pretrained=teacher, batch_size=args.batch_size),
+            model_args=None,
+            tasks=args.tasks,
+            batch_size=args.batch_size,
+            num_fewshot=args.num_fewshot,
+            limit=args.limit,
+        )
+        student_results = lm_eval.simple_evaluate(
+            model=HFLM(pretrained=student, batch_size=args.batch_size),
+            model_args=None,
+            tasks=args.tasks,
+            batch_size=args.batch_size,
+            num_fewshot=args.num_fewshot,
+            limit=args.limit,
+        )
+
+    print("== student ==")
+    print_results(student_results)
+    print("\n== teacher ==")
+    print_results(teacher_results)
+
+    def _json_default(obj):
+        try:
+            return obj.item()
+        except AttributeError:
+            return str(obj)
+
+    payload = {
+        "student": student_results,
+        "teacher": teacher_results,
+    }
     with open(args.output, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(payload, f, indent=2, default=_json_default)
+
 
 if __name__ == "__main__":
     main()
