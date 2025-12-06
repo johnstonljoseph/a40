@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytest
 
-from .solve import solve 
+from a40 import quant
+from .solve import solve
 
 
-def loss(row_abs: torch.Tensor, b: float, s: torch.Tensor) -> torch.Tensor:
+def quant_loss(row_abs: torch.Tensor, b: float, s: torch.Tensor) -> torch.Tensor:
     """Autograd-friendly SiLQ objective."""
     inside = (s * s) / 12.0
     outside = torch.relu(row_abs - s * b).square()
@@ -18,8 +20,8 @@ def optimize_s_with_grad(row_abs: torch.Tensor, b: float, steps: int = 400, lr: 
     opt = torch.optim.Adam([s], lr=lr)
     for _ in range(steps):
         opt.zero_grad()
-        loss = loss(row_abs, b, s)
-        loss.backward()
+        objective = quant_loss(row_abs, b, s)
+        objective.backward()
         opt.step()
         with torch.no_grad():
             s.clamp_(min=1e-8)
@@ -34,7 +36,7 @@ def test_solve_silq_scale_matches_backprop_optimum(num_weights, b=16-0.5):
     assert torch.allclose(solved, optimized, rtol=1e-2, atol=1e-4)
 
 @pytest.mark.parametrize("in_features,out_features", [(3, 2), (64, 128)])
-def test_quant_linear_initialize_matches_backprop_calibration(in_features, out_features):
+def test_quant_linear_quant_fn_matches_manual_solution(in_features, out_features):
     torch.manual_seed(0)
     linear = nn.Linear(in_features, out_features, bias=False)
     with torch.no_grad():
@@ -42,13 +44,17 @@ def test_quant_linear_initialize_matches_backprop_calibration(in_features, out_f
 
     batch_size = 1
     seq_len = 1
-    quant_layer = quant.QuantLinear(in_features, out_features, batch_size, seq_len, bits=4)
-    quant_layer.initialize(linear)
+    quant_layer = quant.QuantLinear(in_features, out_features, bits=4)
+    with torch.no_grad():
+        quant_layer.weight.copy_(linear.weight)
 
     b = float(quant_layer.qmax) - 0.5
-    expected_scales = torch.stack([
-        optimize_s_with_grad(row.abs(), b) for row in linear.weight
-    ])
+    expected_scales = torch.stack(
+        [optimize_s_with_grad(row.abs(), b) for row in linear.weight]
+    )
+
+    with torch.no_grad():
+        quant_layer.set_weight_scales(expected_scales)
 
     calibrated_scales = quant_layer.log_weight_s.exp().squeeze(1)
 

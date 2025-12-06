@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-path",
         type=str,
-        default=Config.student_model_path,
+        default=Config.base_path,
         help="Path (or HF snapshot dir) to the model to calibrate.",
     )
     parser.add_argument(
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="weight_scales",
+        default="/workspace/src/a40/weight_scales",
         help="Directory where per-layer .pt files will be written.",
     )
     parser.add_argument(
@@ -117,3 +117,6 @@ def main():
 
     print(f"[calib] completed: {total_written} files in {output_dir}")
 
+
+if __name__ == "__main__":
+    main()

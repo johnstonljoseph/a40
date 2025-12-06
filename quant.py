@@ -2,15 +2,22 @@ import torch
 import math
 import torch.nn.functional as F
 import torch.nn as nn
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+try:
+    import datasketches  # type: ignore
+except ImportError:  # pragma: no cover
+    datasketches = None
 
 
 @dataclass(frozen=True)
 class ActivationCalibration:
-    batch_size: int = 1
-    seq_len: int = 1
-    sample_count: int = 1
-    percentile: float = 0.9999
+    batch_size: int
+    seq_len: int
+    sample_count: int = 5
+    quantile: float = 0.9999
+    sketch_k: int = 2048
+    sketch: object | None = field(init=False, default=None, repr=False)
 
 
 def sum_like(tensor, s_shape) -> torch.Tensor:
@@ -91,8 +98,8 @@ class QuantLinear(nn.Module):
                 persistent=False,
             )
             self.set_trainable(False)
+            self.sketch = datasketches.kll_floats_sketch(act_calib.sketch_k)
 
-        
 
     def forward(self, x):
         if self.act_calib is not None and self.samples_collected < self.act_calib.sample_count:
@@ -102,7 +109,9 @@ class QuantLinear(nn.Module):
                 self.samples_collected += 1
                 if self.samples_collected == self.act_calib.sample_count:
                     flat = self.act_samples.abs().flatten().to("cpu", dtype=torch.float32)
-                    act_s = torch.quantile(flat, self.act_calib.percentile)
+                    #  act_s = torch.quantile(flat, self.act_calib.percentile)
+                    self.sketch.update(flat.numpy(), probabilities=None)
+                    act_s = torch.tensor(self.sketch.get_quantile(self.act_calib.quantile), dtype=torch.float32)
                     self.log_act_s.copy_(act_s.log())
                     self.set_trainable(True)
             return F.linear(x, self.weight)

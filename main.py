@@ -22,9 +22,8 @@ class Config:
     lr: float = 5e-6
     device: str = "cuda"
     dtype: str = "float32"
-    # student_model_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    # teacher_model_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6"
+    base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    # base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
     dataset_split: str = "train"
@@ -32,11 +31,11 @@ class Config:
     shuffle_buffer_size: int = 10_000
     seed: int = 0
     num_workers: int = 1
-    checkpoint_interval: int = 5
+    checkpoint_interval: int = 10
     checkpoint_dir: str = "checkpoints"
     resume_step: Optional[int] = None  # Step number to resume from (checks checkpoint_dir).
     train_layers: tuple[int, ...] = field(default_factory=tuple)  # Decoder layer indices to update.
-    weight_scale_dir: str = ""  # Optional directory with precomputed weight scales.
+    weight_scale_dir: str = "/workspace/src/a40/weight_scales"
 
 
 def parse_args() -> Config:
@@ -95,7 +94,6 @@ def parse_args() -> Config:
         seq_len=args.seq_len,
         train_layers=train_layers,
         checkpoint_interval=args.checkpoint_interval,
-        log_interval=args.log_interval,
         resume_step=args.resume_step,
         weight_scale_dir=args.weight_scale_dir,
         device=args.device,
@@ -184,7 +182,7 @@ def swap_linear_with_quant(
     module: torch.nn.Module,
     train_layers: tuple[int, ...],
     weight_scale_dir: str,
-    activation_calibration: ActivationCalibration | None = None,
+    act_calib: ActivationCalibration | None = None,
 ) -> None:
     scale_dir = Path(weight_scale_dir).expanduser()
     for layer_index, parent, name, child in _iter_layer_linears(module.model.layers):
@@ -193,7 +191,7 @@ def swap_linear_with_quant(
         quant = QuantLinear(
             child.in_features,
             child.out_features,
-            activation_calibration,
+            act_calib=act_calib,
         )
         setattr(parent, name, quant)
         quant.weight = child.weight
@@ -218,6 +216,7 @@ def save_checkpoint(
     cfg: Config,
 ) -> None:
     checkpoint_path = Path(cfg.checkpoint_dir) / f"step_{step}"
+    print(f"Saving checkpoint to {checkpoint_path}")
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
     torch.save(
@@ -229,7 +228,6 @@ def save_checkpoint(
         },
         checkpoint_path / "checkpoint.pt",
     )
-    print(f"Checkpoint saved at step {step} to {checkpoint_path}")
 
 
 def load_checkpoint(
@@ -257,7 +255,7 @@ def run(cfg: Config) -> None:
     dtype = getattr(torch, cfg.dtype)
 
     print("[run] resolving model paths...", flush=True)
-    base_path = resolve_model_path(cfg.base_model_path)
+    base_path = resolve_model_path(cfg.base_path)
 
     print("[run] loading teacher model...", flush=True)
     teacher = load_model(base_path, device, dtype)
@@ -275,8 +273,8 @@ def run(cfg: Config) -> None:
         swap_linear_with_quant(
             student,
             cfg.train_layers,
-            act_calib,
             cfg.weight_scale_dir,
+            act_calib,
         )
 
     else:
