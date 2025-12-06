@@ -17,15 +17,15 @@ DIR = Path(__file__).resolve().parent
 
 @dataclass
 class Config:
-    steps: int = 10
+    steps: int = 2000
     grad_accum_steps: int = 1
-    batch_size: int = 4
-    seq_len: int = 256
+    batch_size: int = 8
+    seq_len: int = 512
     lr: float = 5e-6
-    device: str = "cpu"
+    device: str = "cuda"
     dtype: str = "float32"
-    # base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    # base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
     dataset_ratio_a: float = 0.75
@@ -33,7 +33,7 @@ class Config:
     shuffle_buffer_size: int = 10_000
     seed: int = 0
     num_workers: int = 1
-    checkpoint_interval: int = 40
+    checkpoint_interval: int = 1000
     starting_step: int = 0
     train_layers: tuple[int, ...] = field(default_factory=tuple)  # Decoder layer indices to update.
 

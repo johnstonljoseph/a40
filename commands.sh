@@ -8,17 +8,14 @@ python -m a40.main \
 --train-layers 2,8,15
 
 
-python -m a40.weight_calibration.main --layers 
+python -m a40.weight_calibration.main --layers 9,10,11,12,13,14
 
-python -m a40.activation_calibration.main --layers 2 --batch_count 1
+python -m a40.activation_calibration.main --layers 1,3,4,5,6,7,9,10,11,12,13,14
 
 
-python -m a40.main \
---steps 40 \
---batch-size 2 \
---seq-len 32 \
---checkpoint-interval 5 \
---train-layers 2,8,15
+python -m a40.main --train-layers 2,8,15
+
+pyhon -m a40.eval 
 
 
 

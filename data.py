@@ -77,8 +77,8 @@ def build_dataloader(cfg: "Config", tokenizer_path: str) -> DataLoader:
     print(f"[data] dataset A ready", flush=True)
     # ds_b = (
     #     datasets.load_dataset(cfg.dataset_b, split="train", streaming=True)
-    #     .map(map_fn)
-    #     .filter(has_text)
+    #     .map(format_to_text, fn_kwargs={"tokenizer": tokenizer})
+    #     .filter(_has_text)
     #     .repeat(None)
     # )
     # print(f"[data] dataset B ready", flush=True)
@@ -86,8 +86,8 @@ def build_dataloader(cfg: "Config", tokenizer_path: str) -> DataLoader:
     print("[data] interleaving + shuffling streams", flush=True)
     repeated_stream = datasets.interleave_datasets(
         # [ds_a, ds_b],
-        [ds_a],
         # probabilities=[cfg.dataset_ratio_a, 1.0 - cfg.dataset_ratio_a],
+        [ds_a],
         probabilities=[1.0],
         seed=cfg.seed,
     ).shuffle(buffer_size=cfg.shuffle_buffer_size, seed=cfg.seed)

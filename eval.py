@@ -57,12 +57,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a quantized checkpoint via lm_eval.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint.pt to load.")
     parser.add_argument(
-        "--teacher-path",
-        type=str,
-        default=Config.teacher_path,
-        help="Teacher model path or HF snapshot directory.",
-    )
-    parser.add_argument(
         "--train-layers",
         type=str,
         required=True,
