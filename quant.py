@@ -2,22 +2,6 @@ import torch
 import math
 import torch.nn.functional as F
 import torch.nn as nn
-from dataclasses import dataclass, field
-
-try:
-    import datasketches  # type: ignore
-except ImportError:  # pragma: no cover
-    datasketches = None
-
-
-@dataclass(frozen=True)
-class ActivationCalibration:
-    batch_size: int
-    seq_len: int
-    sample_count: int = 5
-    quantile: float = 0.9999
-    sketch_k: int = 2048
-    sketch: object | None = field(init=False, default=None, repr=False)
 
 
 def sum_like(tensor, s_shape) -> torch.Tensor:
@@ -31,8 +15,7 @@ def sum_like(tensor, s_shape) -> torch.Tensor:
         if tensor.shape[0] != s_shape[0]:
             raise ValueError()
         return tensor.sum(1, keepdim=True)
-
-
+        
 def scale_grad(grad_out, y, q, s, qmax):
     coef = torch.where(
         y < -qmax,
@@ -80,45 +63,28 @@ class QuantLinear(nn.Module):
         in_features,
         out_features,
         bits: int = 8,
-        act_calib: ActivationCalibration | None = None,
     ):
         super().__init__()
         self.qmax = 1 << (bits - 1)
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
 
-        self.log_act_s = nn.Parameter(torch.zeros(()))
+        self.log_act_s = nn.Parameter(torch.empty(()))
         self.log_weight_s = nn.Parameter(torch.empty(out_features, 1))
 
-        self.act_calib = act_calib
-        if act_calib is not None:
-            self.samples_collected = 0
-            self.register_buffer(
-                "act_samples",
-                torch.empty(act_calib.sample_count, act_calib.batch_size, act_calib.seq_len, in_features),
-                persistent=False,
-            )
-            self.set_trainable(False)
-            self.sketch = datasketches.kll_floats_sketch(act_calib.sketch_k)
-
+        self.weight.requires_grad = True
+        self.log_weight_s.requires_grad = True
+        self.log_act_s.requires_grad = True
 
     def forward(self, x):
-        if self.act_calib is not None and self.samples_collected < self.act_calib.sample_count:
-            with torch.no_grad():
-                sample = x.detach().to(dtype=self.act_samples.dtype)
-                self.act_samples[self.samples_collected].copy_(sample)
-                self.samples_collected += 1
-                if self.samples_collected == self.act_calib.sample_count:
-                    flat = self.act_samples.abs().flatten().to("cpu", dtype=torch.float32)
-                    #  act_s = torch.quantile(flat, self.act_calib.percentile)
-                    self.sketch.update(flat.numpy(), probabilities=None)
-                    act_s = torch.tensor(self.sketch.get_quantile(self.act_calib.quantile), dtype=torch.float32)
-                    self.log_act_s.copy_(act_s.log())
-                    self.set_trainable(True)
-            return F.linear(x, self.weight)
-
         x_q = QuantFn.apply(x, self.log_act_s.exp(), self.qmax)
         w_q = QuantFn.apply(self.weight, self.log_weight_s.exp(), self.qmax)
         return F.linear(x_q, w_q)
+
+    def set_activation_scale(self, clip_value: float) -> None:
+        with torch.no_grad():
+            clip_value = torch.as_tensor(clip_value, dtype=self.log_act_s.dtype, device=self.log_act_s.device)
+            scale = clip_value / self.qmax
+            self.log_act_s.copy_(scale.log())
 
     def set_weight_scales(self, scales: torch.Tensor) -> None:
         if scales.dim() != 1:
@@ -127,8 +93,7 @@ class QuantLinear(nn.Module):
         with torch.no_grad():
             self.log_weight_s.copy_(target.log())
 
-    def set_trainable(self, enabled: bool) -> None:
-        self.weight.requires_grad = enabled
-        self.log_weight_s.requires_grad = enabled
-        self.log_act_s.requires_grad = enabled
-            
+    # def set_trainable(self, enabled: bool) -> None:
+    #     self.weight.requires_grad = enabled
+    #     self.log_weight_s.requires_grad = enabled
+    #     self.log_act_s.requires_grad = enabled

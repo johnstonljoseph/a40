@@ -1,24 +1,18 @@
 import argparse
-import importlib
-import sys
 from pathlib import Path
-from tqdm.auto import tqdm
-from .solve import solve
 
 import torch
+from tqdm.auto import tqdm
 
-# Script is run via `python -m weight_calibration.main` from the a40 directory.
-# Make sure the parent directory (which contains the `a40` namespace) is on sys.path
-# so we can import `a40.main` and reuse its utilities.
-repo_root = Path(__file__).resolve().parents[1]
-project_parent = repo_root.parent
-if str(project_parent) not in sys.path:
-    sys.path.insert(0, str(project_parent))
-main_module = importlib.import_module(f"{repo_root.name}.main")
-Config = main_module.Config  # type: ignore[attr-defined]
-_iter_layer_linears = main_module._iter_layer_linears  # type: ignore[attr-defined]
-load_model = main_module.load_model  # type: ignore[attr-defined]
-resolve_model_path = main_module.resolve_model_path  # type: ignore[attr-defined]
+from a40.main import (
+    Config,
+    iter_layer_linears,
+    load_model,
+    resolve_model_path,
+)
+from .solve import solve
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,12 +28,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         required=True,
         help="Comma-separated decoder layer indices to process (e.g. 0,1,2).",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="/workspace/src/a40/weight_scales",
-        help="Directory where per-layer .pt files will be written.",
     )
     parser.add_argument(
         "--bits",
@@ -92,20 +80,17 @@ def main():
     model_path = resolve_model_path(args.model_path)
     print(f"[calib] loading model from {model_path} (device={device}, dtype={dtype})", flush=True)
     model = load_model(model_path, device, dtype)
-    model.eval()
 
     qmax = 1 << (args.bits - 1)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     total_written = 0
-    for layer_index, _parent, name, child in _iter_layer_linears(model.model.layers):
+    for layer_index, _parent, name, child in iter_layer_linears(model.model.layers):
         if layer_index not in args.layer_ids:
             continue
         print(f"[calib] solving {name} (layer {layer_index})...", flush=True)
         scales = solve_scales(child.weight.detach(), qmax).cpu()
-        layer_dir = output_dir / str(layer_index)
-        layer_dir.mkdir(parents=True, exist_ok=True)
+        layer_dir = SCRIPT_DIR / "values" / str(layer_index)
+        layer_dir.mkdir(exist_ok=True)
         payload = {
             "bits": args.bits,
             "scales": scales,
@@ -114,8 +99,6 @@ def main():
         torch.save(payload, path)
         total_written += 1
         print(f"[calib] wrote {path} ({scales.numel()} values)")
-
-    print(f"[calib] completed: {total_written} files in {output_dir}")
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ from .main import (
     load_checkpoint,
     load_model,
     resolve_model_path,
-    swap_linear_with_quant,
+    hydrate_with_quant,
 )
 
 
@@ -102,7 +102,7 @@ def load_teacher(args: argparse.Namespace):
 
 def load_student(args: argparse.Namespace, teacher: torch.nn.Module):
     model = copy.deepcopy(teacher)
-    swap_linear_with_quant(
+    hydrate_with_quant(
         model,
         args.train_layers,
         weight_scale_dir=args.weight_scale_dir,
