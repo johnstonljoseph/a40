@@ -5,12 +5,13 @@ import os
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import time
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
-from transformers import LlamaForCausalLM
+from transformers import LlamaForCausalLM, LlamaModel
 from tqdm.auto import tqdm
 
 from .quant import QuantLinear
@@ -21,15 +22,14 @@ DIR = Path(__file__).resolve().parent
 
 @dataclass
 class Config:
-    steps: int = 4000
-    grad_accum_steps: int = 1
-    batch_size: int = 16
-    seq_len: int = 512
+    steps: int = 8000
+    batch_size: int = 128 // 8
+    seq_len: int = 16
     lr: float = 5e-6
     device: str = "cuda"
     dtype: str = "bfloat16"
-    base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    # base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    # base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
     dataset_ratio_a: float = 0.75
@@ -37,9 +37,9 @@ class Config:
     shuffle_buffer_size: int = 10_000
     seed: int = 0
     num_workers: int = 1
-    checkpoint_interval: int = 1000
+    checkpoint_interval: int = 0
     starting_step: int = 0
-    train_layers: tuple[int, ...] = field(default_factory=tuple)  # Decoder layer indices to update.
+    train_layers: tuple[int, ...] = field(default_factory=tuple)
 
 
 def parse_args() -> Config:
@@ -75,7 +75,7 @@ def parse_args() -> Config:
         "--device",
         type=str,
         default=Config.device,
-        help="Device to run distillation on (e.g., cuda or cpu).",
+        help="Device to run distillation on (e.g., cuda:x or cpu).",
     )
     parser.add_argument(
         "--dtype",
@@ -127,6 +127,10 @@ def resolve_model_path(path_str: str) -> str:
     )
 
 
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
 def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> LlamaForCausalLM:
     model = LlamaForCausalLM.from_pretrained(model_path, dtype=dtype)
     model.config.use_cache = False
@@ -140,27 +144,12 @@ def freeze_model(model: torch.nn.Module) -> None:
         param.requires_grad = False
 
 
-def iter_linear_modules(module: torch.nn.Module, prefix: str = ""):
-    for name, child in module.named_children():
-        child_prefix = f"{prefix}.{name}" if prefix else name
-        if isinstance(child, torch.nn.Linear):
-            yield module, name, child
-        else:
-            yield from iter_linear_modules(child, child_prefix)
-
-
-def iter_layer_linears(layers: Sequence[torch.nn.Module]):
-    for layer_index, layer in enumerate(layers):
-        for parent, name, child in iter_linear_modules(layer):
-            yield layer_index, parent, name, child
-
-
-def hydrate_with_quant(
-    parent_module: torch.nn.Module,
+def prepare_quant_layers(
+    llama_model: LlamaModel,
     train_layers: tuple[int, ...],
-    hydrate_fresh_non_weight_params: bool = False
+    set_scales: bool = False
 ) -> None:
-    for layer_index, layer in enumerate(parent_module.model.layers):
+    for layer_index, layer in enumerate(llama_model.layers):
         if layer_index not in train_layers:
             continue
         groups = [
@@ -173,7 +162,7 @@ def hydrate_with_quant(
             act_calib_payload = torch.load(activation_calib_path(layer_index, group_name), map_location="cpu")
             clip_value = act_calib_payload.get("clip_value")
 
-            for name in [f"{tok}_proj" for tok in group_name.split("_")]:
+            for name in [f"{prefix}_proj" for prefix in group_name.split("_")]:
                 linear_module = getattr(parent_module, name)
                 quant = QuantLinear(
                     linear_module.in_features,
@@ -184,7 +173,7 @@ def hydrate_with_quant(
                 quant.set_trainable(True)
                 quant.to(linear_module.weight.device)
                 
-                if hydrate_fresh_non_weight_params:
+                if set_scales:
                     quant.set_activation_scale(clip_value)
                     calib_weight_payload = torch.load(weight_calib_path(layer_index, name), map_location="cpu")
                     quant.set_weight_scales(calib_weight_payload.get("scales"))
@@ -195,7 +184,7 @@ def load_checkpoint(
     model: LlamaForCausalLM,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
-    map_location: torch.device | str | None = None,
+    map_location: Optional[torch.device] = None,
 ) -> None:
     """Load checkpoint into model (must already have QuantLinear modules)."""
     ckpt = torch.load(checkpoint_path, weights_only=False, map_location=map_location)
@@ -238,29 +227,21 @@ def compute_token_cross_entropy(
     return (loss * shift_mask).sum() / mask_sum
 
 
-def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    return model.module if isinstance(model, DDP) else model
-
-
 def run(cfg: Config) -> None:
     rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
 
     if distributed:
         if not torch.cuda.is_available():
-            raise RuntimeError("Distributed training requires CUDA devices.")
-        torch.cuda.set_device(local_rank)
-        if not dist.is_initialized():
-            backend = os.environ.get("TORCH_DISTRIBUTED_BACKEND", "nccl")
-            dist.init_process_group(backend=backend, world_size=world_size, rank=rank)
+            raise RuntimeError("Distributed training requires CUDA-capable devices.")
+        torch.cuda.set_device(rank)
+        backend = os.environ.get("TORCH_DISTRIBUTED_BACKEND", "nccl")
+        dist.init_process_group(backend=backend, world_size=world_size, rank=rank)
 
-    device_str = cfg.device
-    if distributed:
-        device_str = f"cuda:{local_rank}"
-    device = torch.device(device_str)
+    device = torch.device(f"cuda:{rank}" if distributed else cfg.device)
     dtype = getattr(torch, cfg.dtype)
+    use_bf16 = dtype == torch.bfloat16
 
     if rank == 0:
         print("[run] resolving model path...", flush=True)
@@ -274,17 +255,24 @@ def run(cfg: Config) -> None:
     if rank == 0:
         print("[run] loading student model...", flush=True)
     student = copy.deepcopy(teacher)
-    hydrate_with_quant(
-        student,
+    prepare_quant_layers(
+        student.model,
         cfg.train_layers,
         cfg.starting_step == 0
     )
-    student.train()
 
     if distributed:
-        student = DDP(student, device_ids=[local_rank], output_device=local_rank)
+        student = DDP(student, device_ids=[rank], output_device=rank)
 
-    optimizer = torch.optim.AdamW(student.parameters(), lr=cfg.lr, weight_decay=0.1)
+    beta2 = 0.95 if use_bf16 else 0.999
+    eps = 1e-10 if use_bf16 else 1e-8
+    optimizer = torch.optim.AdamW(
+        student.parameters(),
+        lr=cfg.lr,
+        betas=(0.9, beta2),
+        eps=eps,
+        weight_decay=0.1,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.steps, eta_min=cfg.lr * 0.1
     )
@@ -296,7 +284,7 @@ def run(cfg: Config) -> None:
             raise FileNotFoundError(f"Checkpoint for step {start_step} not found at {ckpt_path}")
         load_checkpoint(
             str(ckpt_path),
-            _unwrap_model(student),
+            unwrap_model(student),
             optimizer,
             scheduler,
             map_location=device,
@@ -304,18 +292,18 @@ def run(cfg: Config) -> None:
     if rank == 0:
         print(f"[run] resumed from step {start_step}")
 
-    dataloader = build_dataloader(
+    batch_iter = iter(build_dataloader(
         cfg,
         base_path,
-        num_shards=world_size,
-        shard_rank=rank,
-        verbose=(rank == 0),
-    )
-    batch_iter = iter(dataloader)
+        world_size,
+        rank,
+    ))
 
-    step_iter = range(start_step, cfg.steps)
+    data_time_ema: float | None = None
+    step_time_ema: float | None = None
+
     progress = tqdm(
-        step_iter,
+        range(start_step, cfg.steps),
         initial=start_step,
         total=cfg.steps,
         desc="distill",
@@ -324,47 +312,46 @@ def run(cfg: Config) -> None:
     )
 
     for step in progress:
+        step_start = time.perf_counter()
         optimizer.zero_grad()
 
-        kl_total = 0.0
-        student_ce_total = 0.0
-        teacher_ce_total = 0.0
+        data_start = time.perf_counter()
+        batch = next(batch_iter)
+        data_time = time.perf_counter() - data_start
 
-        for _ in range(cfg.grad_accum_steps):
-            batch = next(batch_iter)
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        student_logits = student(input_ids=input_ids, attention_mask=attention_mask).logits
 
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            student_logits = student(input_ids=input_ids, attention_mask=attention_mask).logits
+        with torch.no_grad():
+            teacher_logits = teacher(input_ids=input_ids, attention_mask=attention_mask).logits
 
-            with torch.no_grad():
-                teacher_logits = teacher(input_ids=input_ids, attention_mask=attention_mask).logits
+        kl_loss = compute_kl_loss(student_logits, teacher_logits, attention_mask)
+        kl_loss.backward()
 
-            kl_loss = compute_kl_loss(student_logits, teacher_logits, attention_mask)
-            kl_loss /= cfg.grad_accum_steps
-            kl_loss.backward()
-            kl_total += kl_loss.item()
-            student_ce = compute_token_cross_entropy(
-                student_logits.detach(), input_ids, attention_mask
-            )
-            teacher_ce = compute_token_cross_entropy(
-                teacher_logits, input_ids, attention_mask
-            )
-            student_ce_total += student_ce.item()
-            teacher_ce_total += teacher_ce.item()
+        student_ce = compute_token_cross_entropy(
+            student_logits.detach(), input_ids, attention_mask
+        )
+        teacher_ce = compute_token_cross_entropy(
+            teacher_logits, input_ids, attention_mask
+        )
 
         # clip_grad_norm_(student.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
-
-        avg_student_ce = student_ce_total / cfg.grad_accum_steps
-        avg_teacher_ce = teacher_ce_total / cfg.grad_accum_steps
-        student_ppl = math.exp(avg_student_ce)
-        teacher_ppl = math.exp(avg_teacher_ce)
+        step_time = time.perf_counter() - step_start
 
         if rank == 0:
+            if data_time_ema is None:
+                data_time_ema = data_time
+                step_time_ema = step_time
+            else:
+                data_time_ema = 0.9 * data_time_ema + 0.1 * data_time
+                step_time_ema = 0.9 * step_time_ema + 0.1 * step_time
+            student_ppl = math.exp(student_ce)
+            teacher_ppl = math.exp(teacher_ce)
             progress.set_postfix_str(
-                f"[kl_loss={kl_total:9.6f}, student_ppl={student_ppl:7.2f}, teacher_ppl={teacher_ppl:7.2f}]"
+                f"[kl_loss={kl_loss.item():9.6f}, student_ppl={student_ppl:7.2f}, teacher_ppl={teacher_ppl:7.2f}, data={data_time_ema*1000:.0f}ms, step={step_time_ema:.2f}s]"
             )
 
         if cfg.checkpoint_interval > 0 and (step + 1) % cfg.checkpoint_interval == 0:
@@ -372,7 +359,7 @@ def run(cfg: Config) -> None:
                 print(f"Saving checkpoint for step {step + 1}")
                 torch.save(
                     {
-                        "model": _unwrap_model(student).state_dict(),
+                        "model": unwrap_model(student).state_dict(),
                         "optimizer": optimizer.state_dict(),
                         "scheduler": scheduler.state_dict(),
                     },
@@ -383,6 +370,7 @@ def run(cfg: Config) -> None:
 
     if distributed:
         dist.destroy_process_group()
+
 
 def main() -> None:
     cfg = parse_args()

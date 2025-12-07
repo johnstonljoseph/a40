@@ -67,11 +67,11 @@ def _has_text(example: Dict[str, Any]) -> bool:
 def build_dataloader(
     cfg: "Config",
     tokenizer_path: str,
-    *,
-    num_shards: int = 1,
-    shard_rank: int = 0,
+    world_size: int = 1,
+    rank: int = 0,
 ) -> DataLoader:
-    print(f"[data] loading tokenizer from {tokenizer_path}", flush=True)
+    if rank == 0:
+        print(f"[data] loading tokenizer from {tokenizer_path}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
 
     ds_a = (
@@ -80,33 +80,37 @@ def build_dataloader(
         .filter(_has_text)
         .repeat(None)
     )
-    print(f"[data] dataset A ready", flush=True)
-    # ds_b = (
-    #     datasets.load_dataset(cfg.dataset_b, split="train", streaming=True)
-    #     .map(format_to_text, fn_kwargs={"tokenizer": tokenizer})
-    #     .filter(_has_text)
-    #     .repeat(None)
-    # )
-    # print(f"[data] dataset B ready", flush=True)
+    if rank == 0:
+        print(f"[data] dataset A ready", flush=True)
+    ds_b = (
+        datasets.load_dataset(cfg.dataset_b, split="train", streaming=True)
+        .map(format_to_text, fn_kwargs={"tokenizer": tokenizer})
+        .filter(_has_text)
+        .repeat(None)
+    )
+    if rank == 0:
+        print(f"[data] dataset B ready", flush=True)
 
-    print("[data] interleaving + shuffling streams", flush=True)
     repeated_stream = datasets.interleave_datasets(
-        # [ds_a, ds_b],
-        # probabilities=[cfg.dataset_ratio_a, 1.0 - cfg.dataset_ratio_a],
-        [ds_a],
-        probabilities=[1.0],
+        [ds_a, ds_b],
+        probabilities=[cfg.dataset_ratio_a, 1.0 - cfg.dataset_ratio_a],
+        # [ds_a],
+        # probabilities=[1.0],
         seed=cfg.seed,
     ).shuffle(buffer_size=cfg.shuffle_buffer_size, seed=cfg.seed)
+    if rank == 0:
+        print("[data] shuffled streams", flush=True)
 
-    if num_shards > 1:
-        repeated_stream = repeated_stream.shard(num_shards=num_shards, index=shard_rank, contiguous=True)
+    if world_size > 1:
+        repeated_stream = repeated_stream.shard(num_shards=world_size, index=rank, contiguous=True)
 
-    print("[data] packing tokens", flush=True)
+    if rank == 0:
+        print("[data] packing tokens", flush=True)
     iterable = PackedStreamingDataset(repeated_stream, tokenizer_path, cfg.seq_len)
-    print("[data] dataloader ready", flush=True)
+    if rank == 0:
+        print("[data] dataloader ready", flush=True)
     return DataLoader(
         iterable,
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
-        # prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
     )

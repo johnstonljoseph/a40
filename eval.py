@@ -14,7 +14,7 @@ from .main import (
     load_checkpoint,
     load_model,
     resolve_model_path,
-    hydrate_with_quant,
+    prepare_quant_layers,
 )
 
 
@@ -104,10 +104,10 @@ def load_teacher(args: argparse.Namespace):
 def load_student(args: argparse.Namespace, teacher: torch.nn.Module):
     model = copy.deepcopy(teacher)
     print("  Hydrating...")
-    hydrate_with_quant(
+    prepare_quant_layers(
         model,
         args.train_layers,
-        hydrate_fresh_non_weight_params=False,
+        set_scales=False,
     )
     print("  Loading checkpoint...")
     load_checkpoint(str(args.checkpoint_path), model, map_location=args.device)

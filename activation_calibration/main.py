@@ -119,8 +119,8 @@ def main():
     dataloader = build_dataloader(
         cfg,
         model_path,
-        num_shards=world_size,
-        shard_rank=rank,
+        world_size=world_size,
+        rank=rank,
         verbose=(rank == 0),
     )
     batch_iter = iter(dataloader)
