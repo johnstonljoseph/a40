@@ -42,26 +42,24 @@ class PackedStreamingDataset(IterableDataset):
                 }
 
 
-def format_to_text(example: Dict[str, Any], tokenizer: PreTrainedTokenizerBase) -> Dict[str, str]:
-    text = example.get("text")
-    if isinstance(text, str) and text.strip():
-        return {"text": text}
+def to_text_stream(ds, tokenizer):
+    text_features = datasets.Features({"text": datasets.Value("string")})
 
-    messages = example.get("messages")
-    if isinstance(messages, list) and messages:
-        rendered = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        return {"text": rendered.strip()}
+    def generator():
+        for example in ds:
+            text = example.get("text")
+            if isinstance(text, str) and text.strip():
+                yield {"text": text}
+            elif isinstance(messages := example.get("messages"), list) and messages:
+                rendered = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                ).strip()
+                if rendered:
+                    yield {"text": rendered}
 
-    return {"text": ""}
-
-
-def _has_text(example: Dict[str, Any]) -> bool:
-    text = example.get("text")
-    return isinstance(text, str) and bool(text.strip())
+    return datasets.IterableDataset.from_generator(generator, features=text_features).repeat(None)
 
 
 def build_dataloader(
@@ -74,19 +72,15 @@ def build_dataloader(
         print(f"[data] loading tokenizer from {tokenizer_path}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
 
-    ds_a = (
-        datasets.load_dataset(cfg.dataset_a, split="train", streaming=True)
-        .map(format_to_text, fn_kwargs={"tokenizer": tokenizer})
-        .filter(_has_text)
-        .repeat(None)
+    ds_a = to_text_stream(
+        datasets.load_dataset(cfg.dataset_a, split="train", streaming=False),
+        tokenizer,
     )
     if rank == 0:
         print(f"[data] dataset A ready", flush=True)
-    ds_b = (
-        datasets.load_dataset(cfg.dataset_b, split="train", streaming=True)
-        .map(format_to_text, fn_kwargs={"tokenizer": tokenizer})
-        .filter(_has_text)
-        .repeat(None)
+    ds_b = to_text_stream(
+        datasets.load_dataset(cfg.dataset_b, split="train", streaming=True),
+        tokenizer,
     )
     if rank == 0:
         print(f"[data] dataset B ready", flush=True)
@@ -94,8 +88,6 @@ def build_dataloader(
     repeated_stream = datasets.interleave_datasets(
         [ds_a, ds_b],
         probabilities=[cfg.dataset_ratio_a, 1.0 - cfg.dataset_ratio_a],
-        # [ds_a],
-        # probabilities=[1.0],
         seed=cfg.seed,
     ).shuffle(buffer_size=cfg.shuffle_buffer_size, seed=cfg.seed)
     if rank == 0:

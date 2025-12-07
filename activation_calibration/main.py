@@ -88,13 +88,12 @@ def register_collectors(model: torch.nn.Module, target_layers: Tuple[int, ...], 
 def main():
     args = parse_args()
     rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
     device_str = args.device
     if device_str.startswith("cuda"):
-        device_str = f"cuda:{local_rank}"
-        torch.cuda.set_device(local_rank)
+        device_str = f"cuda:{rank}"
+        torch.cuda.set_device(rank)
     device = torch.device(device_str)
     dtype = getattr(torch, args.dtype)
 
@@ -121,7 +120,6 @@ def main():
         model_path,
         world_size=world_size,
         rank=rank,
-        verbose=(rank == 0),
     )
     batch_iter = iter(dataloader)
 

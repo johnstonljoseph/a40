@@ -10,7 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Iterable, Iterator, Optional, Sequence
 from transformers import LlamaForCausalLM, LlamaModel
 from tqdm.auto import tqdm
 
@@ -24,12 +24,12 @@ DIR = Path(__file__).resolve().parent
 class Config:
     steps: int = 8000
     batch_size: int = 128 // 8
-    seq_len: int = 16
+    seq_len: int = 1024
     lr: float = 5e-6
     device: str = "cuda"
     dtype: str = "bfloat16"
-    # base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    # base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
     dataset_ratio_a: float = 0.75
@@ -37,7 +37,7 @@ class Config:
     shuffle_buffer_size: int = 10_000
     seed: int = 0
     num_workers: int = 1
-    checkpoint_interval: int = 0
+    checkpoint_interval: int = 2000
     starting_step: int = 0
     train_layers: tuple[int, ...] = field(default_factory=tuple)
 
@@ -179,6 +179,28 @@ def prepare_quant_layers(
                     quant.set_weight_scales(calib_weight_payload.get("scales"))
 
 
+def iter_layer_linears(
+    layers: Iterable[torch.nn.Module],
+) -> Iterator[tuple[int, torch.nn.Module, str, torch.nn.Module]]:
+    """Yield each target linear module in decoder layers."""
+
+    targets = (
+        ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")),
+        ("mlp", ("gate_proj", "up_proj", "down_proj")),
+    )
+
+    for layer_index, layer in enumerate(layers):
+        for parent_name, child_names in targets:
+            parent = getattr(layer, parent_name, None)
+            if parent is None:
+                continue
+            for name in child_names:
+                child = getattr(parent, name, None)
+                if child is None:
+                    continue
+                yield layer_index, parent, name, child
+
+
 def load_checkpoint(
     checkpoint_path: str,
     model: LlamaForCausalLM,
@@ -250,11 +272,11 @@ def run(cfg: Config) -> None:
     if rank == 0:
         print("[run] loading teacher model...", flush=True)
     teacher = load_model(base_path, device, dtype)
-    freeze_model(teacher)
 
     if rank == 0:
         print("[run] loading student model...", flush=True)
     student = copy.deepcopy(teacher)
+    freeze_model(teacher)
     prepare_quant_layers(
         student.model,
         cfg.train_layers,
@@ -379,4 +401,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

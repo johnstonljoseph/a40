@@ -30,12 +30,6 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated decoder layer indices to process (e.g. 0,1,2).",
     )
     parser.add_argument(
-        "--bits",
-        type=int,
-        default=8,
-        help="Quantization bit-width (must match QuantLinear configuration).",
-    )
-    parser.add_argument(
         "--device",
         type=str,
         default=Config.device,
@@ -44,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dtype",
         type=str,
-        default=Config.dtype,
+        default="float32",
         help="Torch dtype to load the model with (e.g., float32, bfloat16).",
     )
     args = parser.parse_args()
@@ -81,7 +75,8 @@ def main():
     print(f"[calib] loading model from {model_path} (device={device}, dtype={dtype})", flush=True)
     model = load_model(model_path, device, dtype)
 
-    qmax = 1 << (args.bits - 1)
+    bits = 8
+    qmax = 1 << (bits - 1)
 
     total_written = 0
     for layer_index, _parent, name, child in iter_layer_linears(model.model.layers):
@@ -92,7 +87,7 @@ def main():
         layer_dir = SCRIPT_DIR / "values" / str(layer_index)
         layer_dir.mkdir(exist_ok=True)
         payload = {
-            "bits": args.bits,
+            "bits": bits,
             "scales": scales,
         }
         path = layer_dir / f"{name}.pt"
