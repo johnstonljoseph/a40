@@ -102,9 +102,9 @@ def load_teacher(args: argparse.Namespace):
 
 def load_student(args: argparse.Namespace, teacher: torch.nn.Module):
     model = copy.deepcopy(teacher)
-    print("  Hydrating...")
+    print("  Preparing quantized student...")
     prepare_quant_layers(
-        model,
+        model.model,
         args.train_layers,
         set_scales=False,
     )
