@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterator
+from typing import Any, Dict, Iterator, Iterable
 
 import datasets
 import torch
@@ -11,19 +11,9 @@ class PackedStreamingDataset(IterableDataset):
     """
     Concatenate all tokens from the stream and yield dense seq_len chunks.
     No padding, no truncation waste—every token is used.
-
-    We also do manual sharding across DDP ranks: each rank only consumes
-    every `world_size`-th document from the underlying stream.
     """
 
-    def __init__(
-        self,
-        stream,
-        tokenizer_path: str,
-        seq_len: int,
-        world_size: int = 1,
-        rank: int = 0,
-    ) -> None:
+    def __init__(self, stream, tokenizer_path: str, seq_len: int) -> None:
         self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
             tokenizer_path,
             use_fast=True,
@@ -31,20 +21,11 @@ class PackedStreamingDataset(IterableDataset):
         self.stream = stream
         self.seq_len = seq_len
         self.eos_id = self.tokenizer.eos_token_id
-        self.world_size = world_size
-        self.rank = rank
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         buffer: list[int] = []
-        doc_idx = 0  # count documents, used for manual sharding
 
         for example in self.stream:
-            # manual shard: only keep docs for this rank
-            if (doc_idx % self.world_size) != self.rank:
-                doc_idx += 1
-                continue
-            doc_idx += 1
-
             # Tokenize without padding/truncation; get raw token ids
             ids = self.tokenizer.encode(example["text"], add_special_tokens=False)
             # Append EOS to mark document boundary
@@ -78,8 +59,7 @@ def to_text_stream(ds, tokenizer):
                 if rendered:
                     yield {"text": rendered}
 
-    # no .repeat() here; we do it later after mixing
-    return datasets.IterableDataset.from_generator(generator, features=text_features)
+    return datasets.IterableDataset.from_generator(generator, features=text_features).repeat(None)
 
 
 def build_dataloader(
@@ -92,9 +72,8 @@ def build_dataloader(
         print(f"[data] loading tokenizer from {tokenizer_path}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
 
-    # use streaming=True for both so everything is iterable
     ds_a = to_text_stream(
-        datasets.load_dataset(cfg.dataset_a, split="train", streaming=True),
+        datasets.load_dataset(cfg.dataset_a, split="train", streaming=False),
         tokenizer,
     )
     if rank == 0:
@@ -106,27 +85,22 @@ def build_dataloader(
     if rank == 0:
         print(f"[data] dataset B ready", flush=True)
 
-    # interleave, then shuffle, then repeat (infinite)
-    stream = datasets.interleave_datasets(
+    repeated_stream = datasets.interleave_datasets(
         [ds_a, ds_b],
         probabilities=[cfg.dataset_ratio_a, 1.0 - cfg.dataset_ratio_a],
         seed=cfg.seed,
-    )
-    stream = stream.shuffle(buffer_size=cfg.shuffle_buffer_size, seed=cfg.seed)
-    stream = stream.repeat(None)
+    ).shuffle(buffer_size=cfg.shuffle_buffer_size, seed=cfg.seed)
+    if rank == 0:
+        print("[data] shuffled streams", flush=True)
+
+    if world_size > 1:
+        repeated_stream = repeated_stream.shard(num_shards=world_size, index=rank, contiguous=True)
 
     if rank == 0:
         print("[data] packing tokens", flush=True)
-    iterable = PackedStreamingDataset(
-        stream,
-        tokenizer_path,
-        cfg.seq_len,
-        world_size=world_size,
-        rank=rank,
-    )
+    iterable = PackedStreamingDataset(repeated_stream, tokenizer_path, cfg.seq_len)
     if rank == 0:
         print("[data] dataloader ready", flush=True)
-
     return DataLoader(
         iterable,
         batch_size=cfg.batch_size,

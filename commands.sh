@@ -1,21 +1,9 @@
 
-
-python -m a40.main \
---steps 4000 \
---batch-size 32 \
---seq-len 256 \
---checkpoint-interval 500 \
---train-layers 2,8,15
-
 python -m a40.weight_calibration.main --layers 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 
-python -m a40.activation_calibration.main --layers 0,1,3,4,5,6,7,9,10,11,12,13,14,15
-
+python -m a40.activation_calibration.main --layers 0,1,2,3,4,5,6,7,9,10,11,12,13,14,15
 
 python -m a40.main --train-layers 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-
-pyhon -m a40.eval 
-
 
 
 # Train on cpu
