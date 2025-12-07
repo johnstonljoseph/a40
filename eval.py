@@ -18,7 +18,6 @@ from .main import (
 )
 
 
-# Default location for stored training checkpoints
 DEFAULT_CHECKPOINTS_DIR = Path(
     # "/Users/joseph/Library/CloudStorage/GoogleDrive-johnstonljoseph@gmail.com/My Drive/a40/checkpoints"
     "/workspace/a40/checkpoints"
