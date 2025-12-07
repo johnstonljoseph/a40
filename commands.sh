@@ -7,13 +7,12 @@ python -m a40.main \
 --checkpoint-interval 500 \
 --train-layers 2,8,15
 
+python -m a40.weight_calibration.main --layers 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 
-python -m a40.weight_calibration.main --layers 9,10,11,12,13,14
-
-python -m a40.activation_calibration.main --layers 1,3,4,5,6,7,9,10,11,12,13,14
+python -m a40.activation_calibration.main --layers 0,1,3,4,5,6,7,9,10,11,12,13,14,15
 
 
-python -m a40.main --train-layers 2,8,15
+python -m a40.main --train-layers 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 
 pyhon -m a40.eval 
 
@@ -21,7 +20,7 @@ pyhon -m a40.eval
 
 
 # Eval
-python -m a40.eval --checkpoint-step 1000 --train-layers 2,8,15 --batch-size 8 --seq-len 512 --tasks gsm8k
+python -m a40.eval --checkpoint-step 1000 --train-layers 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 --batch-size 16 --seq-len 512 --tasks gsm8k
 
 
 

@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -86,22 +87,52 @@ def register_collectors(model: torch.nn.Module, target_layers: Tuple[int, ...], 
 
 def main():
     args = parse_args()
-    device = torch.device(args.device)
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    device_str = args.device
+    if device_str.startswith("cuda"):
+        device_str = f"cuda:{local_rank}"
+        torch.cuda.set_device(local_rank)
+    device = torch.device(device_str)
     dtype = getattr(torch, args.dtype)
 
     model_path = resolve_model_path(args.model_path)
-    print(f"[calib] loading model from {model_path} (device={device}, dtype={dtype})", flush=True)
+    if rank == 0:
+        print(
+            f"[calib] loading model from {model_path} "
+            f"(device={device}, dtype={dtype}, world_size={world_size})",
+            flush=True,
+        )
     model = load_model(model_path, device, dtype)
 
-    collectors, handles = register_collectors(model, args.layer_ids, args)
+    assigned_layers = args.layer_ids[rank::world_size]
+    if not assigned_layers:
+        print(f"[calib][rank {rank}] no target layers assigned; exiting early.", flush=True)
+        return
+    print(f"[calib][rank {rank}] handling layers {assigned_layers}", flush=True)
+
+    collectors, handles = register_collectors(model, assigned_layers, args)
 
     cfg = Config(batch_size=args.batch_size, seq_len=args.seq_len)
-    dataloader = build_dataloader(cfg, model_path)
+    dataloader = build_dataloader(
+        cfg,
+        model_path,
+        num_shards=world_size,
+        shard_rank=rank,
+        verbose=(rank == 0),
+    )
     batch_iter = iter(dataloader)
 
-    print(f"[calib] streaming {args.batch_count} batches...", flush=True)
+    if rank == 0:
+        print(f"[calib] streaming {args.batch_count} batches per rank...", flush=True)
     with torch.no_grad():
-        for _ in tqdm(range(args.batch_count), desc="activation-calib"):
+        for _ in tqdm(
+            range(args.batch_count),
+            desc=f"activation-calib[r{rank}]",
+            disable=(rank != 0),
+        ):
             batch = next(batch_iter)
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
@@ -122,7 +153,8 @@ def main():
         path = layer_dir / f"{group_name}.pt"
         torch.save(payload, path)
         print(
-            f"[calib] wrote {layer_index}.{group_name} (clip_value={clip_value:.6f}, max_abs={collector.max_abs:.6f})"
+            f"[calib][rank {rank}] wrote {layer_index}.{group_name} "
+            f"(clip_value={clip_value:.6f}, max_abs={collector.max_abs:.6f})"
         )
 
 

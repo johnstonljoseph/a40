@@ -64,7 +64,13 @@ def _has_text(example: Dict[str, Any]) -> bool:
     return isinstance(text, str) and bool(text.strip())
 
 
-def build_dataloader(cfg: "Config", tokenizer_path: str) -> DataLoader:
+def build_dataloader(
+    cfg: "Config",
+    tokenizer_path: str,
+    *,
+    num_shards: int = 1,
+    shard_rank: int = 0,
+) -> DataLoader:
     print(f"[data] loading tokenizer from {tokenizer_path}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
 
@@ -91,6 +97,9 @@ def build_dataloader(cfg: "Config", tokenizer_path: str) -> DataLoader:
         probabilities=[1.0],
         seed=cfg.seed,
     ).shuffle(buffer_size=cfg.shuffle_buffer_size, seed=cfg.seed)
+
+    if num_shards > 1:
+        repeated_stream = repeated_stream.shard(num_shards=num_shards, index=shard_rank, contiguous=True)
 
     print("[data] packing tokens", flush=True)
     iterable = PackedStreamingDataset(repeated_stream, tokenizer_path, cfg.seq_len)

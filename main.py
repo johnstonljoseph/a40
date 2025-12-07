@@ -1,9 +1,12 @@
 import argparse
 import copy
 import math
+import os
 import torch
-from torch.nn.utils import clip_grad_norm_
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.utils import clip_grad_norm_
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
@@ -18,15 +21,15 @@ DIR = Path(__file__).resolve().parent
 
 @dataclass
 class Config:
-    steps: int = 2000
+    steps: int = 4000
     grad_accum_steps: int = 1
-    batch_size: int = 8
+    batch_size: int = 16
     seq_len: int = 512
     lr: float = 5e-6
-    device: str = "cpu"
-    dtype: str = "float32"
-    # base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    # base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
     dataset_ratio_a: float = 0.75
@@ -178,6 +181,7 @@ def hydrate_with_quant(
                 )
                 setattr(parent_module, name, quant)
                 quant.weight = linear_module.weight
+                quant.set_trainable(True)
                 quant.to(linear_module.weight.device)
                 
                 if hydrate_fresh_non_weight_params:
@@ -234,24 +238,51 @@ def compute_token_cross_entropy(
     return (loss * shift_mask).sum() / mask_sum
 
 
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
 def run(cfg: Config) -> None:
-    device = torch.device(cfg.device)
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Distributed training requires CUDA devices.")
+        torch.cuda.set_device(local_rank)
+        if not dist.is_initialized():
+            backend = os.environ.get("TORCH_DISTRIBUTED_BACKEND", "nccl")
+            dist.init_process_group(backend=backend, world_size=world_size, rank=rank)
+
+    device_str = cfg.device
+    if distributed:
+        device_str = f"cuda:{local_rank}"
+    device = torch.device(device_str)
     dtype = getattr(torch, cfg.dtype)
 
-    print("[run] resolving model path...", flush=True)
+    if rank == 0:
+        print("[run] resolving model path...", flush=True)
     base_path = resolve_model_path(cfg.base_path)
 
-    print("[run] loading teacher model...", flush=True)
+    if rank == 0:
+        print("[run] loading teacher model...", flush=True)
     teacher = load_model(base_path, device, dtype)
     freeze_model(teacher)
 
-    print("[run] loading student model...", flush=True)
+    if rank == 0:
+        print("[run] loading student model...", flush=True)
     student = copy.deepcopy(teacher)
     hydrate_with_quant(
         student,
         cfg.train_layers,
         cfg.starting_step == 0
     )
+    student.train()
+
+    if distributed:
+        student = DDP(student, device_ids=[local_rank], output_device=local_rank)
 
     optimizer = torch.optim.AdamW(student.parameters(), lr=cfg.lr, weight_decay=0.1)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -263,17 +294,33 @@ def run(cfg: Config) -> None:
         ckpt_path = checkpoint_path(start_step)
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint for step {start_step} not found at {ckpt_path}")
-        load_checkpoint(str(ckpt_path), student, optimizer, scheduler)
-    print(f"[run] resumed from step {start_step}")
+        load_checkpoint(
+            str(ckpt_path),
+            _unwrap_model(student),
+            optimizer,
+            scheduler,
+            map_location=device,
+        )
+    if rank == 0:
+        print(f"[run] resumed from step {start_step}")
 
-    batch_iter = iter(build_dataloader(cfg, base_path))
+    dataloader = build_dataloader(
+        cfg,
+        base_path,
+        num_shards=world_size,
+        shard_rank=rank,
+        verbose=(rank == 0),
+    )
+    batch_iter = iter(dataloader)
 
+    step_iter = range(start_step, cfg.steps)
     progress = tqdm(
-        range(start_step, cfg.steps),
+        step_iter,
         initial=start_step,
         total=cfg.steps,
         desc="distill",
         bar_format="{desc}: |{bar}| {n_fmt}/{total_fmt}{postfix}",
+        disable=(rank != 0),
     )
 
     for step in progress:
@@ -315,21 +362,27 @@ def run(cfg: Config) -> None:
         student_ppl = math.exp(avg_student_ce)
         teacher_ppl = math.exp(avg_teacher_ce)
 
-        progress.set_postfix_str(
-            f"[kl_loss={kl_total:9.6f}, student_ppl={student_ppl:7.2f}, teacher_ppl={teacher_ppl:7.2f}]"
-        )
+        if rank == 0:
+            progress.set_postfix_str(
+                f"[kl_loss={kl_total:9.6f}, student_ppl={student_ppl:7.2f}, teacher_ppl={teacher_ppl:7.2f}]"
+            )
 
         if cfg.checkpoint_interval > 0 and (step + 1) % cfg.checkpoint_interval == 0:
-            print(f"Saving checkpoint for step {step + 1}")
-            torch.save(
-                {
-                    "model": student.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                },
-                checkpoint_path(step + 1)
-            )
-            
+            if rank == 0:
+                print(f"Saving checkpoint for step {step + 1}")
+                torch.save(
+                    {
+                        "model": _unwrap_model(student).state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                    },
+                    checkpoint_path(step + 1)
+                )
+            if distributed:
+                dist.barrier()
+
+    if distributed:
+        dist.destroy_process_group()
 
 def main() -> None:
     cfg = parse_args()

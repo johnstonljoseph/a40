@@ -71,13 +71,11 @@ class QuantLinear(nn.Module):
         self.log_act_s = nn.Parameter(torch.empty(()))
         self.log_weight_s = nn.Parameter(torch.empty(out_features, 1))
 
-        self.weight.requires_grad = True
-        self.log_weight_s.requires_grad = True
-        self.log_act_s.requires_grad = True
-
     def forward(self, x):
-        x_q = QuantFn.apply(x, self.log_act_s.exp(), self.qmax)
-        w_q = QuantFn.apply(self.weight, self.log_weight_s.exp(), self.qmax)
+        act_scale = self.log_act_s.exp().to(x.dtype)
+        weight_scale = self.log_weight_s.exp().to(self.weight.dtype)
+        x_q = QuantFn.apply(x, act_scale, self.qmax)
+        w_q = QuantFn.apply(self.weight, weight_scale, self.qmax)
         return F.linear(x_q, w_q)
 
     def set_activation_scale(self, clip_value: float) -> None:
@@ -93,7 +91,7 @@ class QuantLinear(nn.Module):
         with torch.no_grad():
             self.log_weight_s.copy_(target.log())
 
-    # def set_trainable(self, enabled: bool) -> None:
-    #     self.weight.requires_grad = enabled
-    #     self.log_weight_s.requires_grad = enabled
-    #     self.log_act_s.requires_grad = enabled
+    def set_trainable(self, enabled: bool) -> None:
+        self.weight.requires_grad = enabled
+        self.log_weight_s.requires_grad = enabled
+        self.log_act_s.requires_grad = enabled
