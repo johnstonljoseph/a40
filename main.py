@@ -23,23 +23,24 @@ DIR = Path(__file__).resolve().parent
 @dataclass
 class Config:
     steps: int = 10000
-    batch_size: int = 16
+    batch_size: int = 20
     seq_len: int = 1024
     lr: float = 5e-6
     device: str = "cuda"
     dtype: str = "bfloat16"
-    base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Llama-3.1-Tulu-3.1-8B"
+    # models--meta-llama--Llama-3.2-1B-Instruct"
     # base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
-    dataset_ratio_a: float = 0.60
+    dataset_ratio_a: float = 0.5
     dataset_split: str = "train"
     shuffle_buffer_size: int = 10_000
     seed: int = 0
     num_workers: int = 1
     checkpoint_interval: int = 2000
     starting_step: int = 0
-    train_layers: tuple[int, ...] = field(default_factory=tuple)
+    train_layers: Optional[tuple[int, ...]] = field(default=None)
     penalty_scale: float = 0
     margin_weight: float = 0.0
     align_weight: float = 32.0
@@ -59,8 +60,8 @@ def parse_args() -> Config:
     parser.add_argument(
         "--train-layers",
         type=str,
-        required=True,
-        help="Comma-separated decoder layer indices to finetune",
+        default="all",
+        help="Comma-separated decoder layer indices to finetune or 'all' (default)",
     )
     parser.add_argument(
         "--checkpoint-interval",
@@ -106,7 +107,11 @@ def parse_args() -> Config:
     )
     args = parser.parse_args()
     raw_train_layers = args.train_layers.strip()
-    train_layers = tuple(int(tok) for tok in raw_train_layers.split(",") if tok.strip())
+    train_layers = (
+        None
+        if raw_train_layers.lower() == "all"
+        else tuple(int(tok) for tok in raw_train_layers.split(",") if tok.strip())
+    )
     return Config(
         steps=args.steps,
         batch_size=args.batch_size,
@@ -419,9 +424,12 @@ def run(cfg: Config) -> None:
     # Freeze only embedding and lm_head, train everything else
     student.model.embed_tokens.requires_grad_(False)
     student.lm_head.requires_grad_(False)
+    target_layers = cfg.train_layers
+    if target_layers is None:
+        target_layers = tuple(range(len(student.model.layers)))
     prepare_quant_layers(
         student.model,
-        cfg.train_layers,
+        target_layers,
         cfg.starting_step == 0
     )
 
@@ -516,8 +524,22 @@ def run(cfg: Config) -> None:
             median_rel_margin = metrics["median_rel_margin"]
             flip_severity = metrics["avg_flip_severity"]
 
-        # penalty_term = torch.tensor(0.0, device=device)
-        loss = anchor_loss
+        mask = attention_mask.float()
+
+        # Masked MSE on logits
+        mse = ((teacher_logits - student_logits).pow(2).sum(dim=-1) * mask).sum() / mask.sum()
+
+        # Masked hard top-1 CE against teacher argmax
+        temp = 4
+        teacher_idx = teacher_logits.argmax(dim=-1)
+        top1 = torch.nn.functional.cross_entropy(
+            (student_logits / temp).view(-1, student_logits.size(-1)),
+            teacher_idx.view(-1),
+            reduction="none",
+        )
+        top1 = (top1 * mask.view(-1)).sum() / mask.sum()
+
+        loss = mse + top1
 
         best_act, best_act_name = quant_max_activation(unwrap_model(student))
 

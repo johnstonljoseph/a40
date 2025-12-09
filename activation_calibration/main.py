@@ -1,7 +1,7 @@
 import argparse
 import os
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import torch
 from tqdm.auto import tqdm
@@ -20,10 +20,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--layers",
         type=str,
-        required=True,
-        help="Comma-separated decoder layer indices.",
+        default="all",
+        help="Comma-separated decoder layer indices or 'all' (default).",
     )
-    parser.add_argument("--batch_count", type=int, default=5)
+    parser.add_argument("--batch_count", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--seq-len", type=int, default=Config.seq_len)
     parser.add_argument("--quantile", type=float, default=0.9999)
@@ -31,7 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=Config.device)
     parser.add_argument("--dtype", type=str, default=Config.dtype)
     args = parser.parse_args()
-    args.layer_ids = tuple(int(tok) for tok in args.layers.strip().split(",") if tok.strip())
+    raw_layers = args.layers.strip()
+    args.layer_ids: Optional[Tuple[int, ...]] = (
+        None
+        if raw_layers.lower() == "all"
+        else tuple(int(tok) for tok in raw_layers.split(",") if tok.strip())
+    )
     return args
 
 
@@ -105,6 +110,9 @@ def main():
             flush=True,
         )
     model = load_model(model_path, device, dtype)
+
+    if args.layer_ids is None:
+        args.layer_ids = tuple(range(len(model.model.layers)))
 
     assigned_layers = args.layer_ids[rank::world_size]
     if not assigned_layers:

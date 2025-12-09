@@ -26,8 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--layers",
         type=str,
-        required=True,
-        help="Comma-separated decoder layer indices to process (e.g. 0,1,2).",
+        default="all",
+        help="Comma-separated decoder layer indices to process (e.g. 0,1,2) or 'all' (default).",
     )
     parser.add_argument(
         "--device",
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     raw_layers = args.layers.strip()
-    args.layer_ids = tuple(int(tok) for tok in raw_layers.split(",") if tok.strip())
+    args.layer_ids = None if raw_layers.lower() == "all" else tuple(int(tok) for tok in raw_layers.split(",") if tok.strip())
     return args
 
 
@@ -79,6 +79,8 @@ def main():
     qmax = 1 << (bits - 1)
 
     total_written = 0
+    if args.layer_ids is None:
+        args.layer_ids = tuple(range(len(model.model.layers)))
     for layer_index, _parent, name, child in iter_layer_linears(model.model.layers):
         if layer_index not in args.layer_ids:
             continue
