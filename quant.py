@@ -70,13 +70,22 @@ class QuantLinear(nn.Module):
 
         self.log_act_s = nn.Parameter(torch.empty(()))
         self.log_weight_s = nn.Parameter(torch.empty(out_features, 1))
+        self.last_penalty: torch.Tensor | None = None
+        self.last_max_act: torch.Tensor | None = None
 
     def forward(self, x):
+        clip_t = 12.0
+        act_penalty = F.softplus(x.abs() - clip_t).square().mean()
         act_scale = self.log_act_s.exp().to(x.dtype)
         weight_scale = self.log_weight_s.exp().to(self.weight.dtype)
-        x_q = QuantFn.apply(x, act_scale, self.qmax)
-        w_q = QuantFn.apply(self.weight, weight_scale, self.qmax)
-        return F.linear(x_q, w_q)
+        # x_q = QuantFn.apply(x, act_scale, self.qmax)
+        # w_q = QuantFn.apply(self.weight, weight_scale, self.qmax)
+        # return F.linear(x_q, w_q)
+        y = F.linear(x, self.weight)
+        out_penalty = F.softplus(y.abs() - clip_t).square().mean()
+        self.last_penalty = act_penalty + out_penalty
+        self.last_max_act = torch.max(x.detach().abs().max(), y.detach().abs().max())
+        return y
 
     def set_activation_scale(self, clip_value: float) -> None:
         with torch.no_grad():
@@ -92,6 +101,7 @@ class QuantLinear(nn.Module):
             self.log_weight_s.copy_(target.log())
 
     def set_trainable(self, enabled: bool) -> None:
-        self.weight.requires_grad = enabled
-        self.log_weight_s.requires_grad = enabled
-        self.log_act_s.requires_grad = enabled
+        None
+        # self.weight.requires_grad = enabled
+        # self.log_weight_s.requires_grad = enabled
+        # self.log_act_s.requires_grad = enabled

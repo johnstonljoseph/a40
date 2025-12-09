@@ -23,23 +23,25 @@ DIR = Path(__file__).resolve().parent
 @dataclass
 class Config:
     steps: int = 8000
-    batch_size: int = 128 // 8
-    seq_len: int = 1024
+    batch_size: int = 2
+    #  128 // 8
+    seq_len: int = 512
     lr: float = 5e-6
     device: str = "cuda"
     dtype: str = "bfloat16"
-    base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    # base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    # base_path: str = "/workspace/.hf_home/hub/models--meta-llama--Llama-3.2-1B-Instruct"
+    base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
     dataset_ratio_a: float = 0.75
     dataset_split: str = "train"
     shuffle_buffer_size: int = 10_000
     seed: int = 0
-    num_workers: int = 1
+    num_workers: int = 0
     checkpoint_interval: int = 2000
     starting_step: int = 0
     train_layers: tuple[int, ...] = field(default_factory=tuple)
+    penalty_scale: float = 1
 
 
 def parse_args() -> Config:
@@ -83,6 +85,12 @@ def parse_args() -> Config:
         default=Config.dtype,
         help="Torch dtype for loading models (e.g., float32, bfloat16).",
     )
+    parser.add_argument(
+        "--weight-penalty-scale",
+        type=float,
+        default=Config.penalty_scale,
+        help="Multiplier for quant weight penalty loss.",
+    )
     args = parser.parse_args()
     raw_train_layers = args.train_layers.strip()
     train_layers = tuple(int(tok) for tok in raw_train_layers.split(",") if tok.strip())
@@ -95,6 +103,7 @@ def parse_args() -> Config:
         starting_step=args.starting_step,
         device=args.device,
         dtype=args.dtype,
+        penalty_scale=args.weight_penalty_scale,
     )
 
 
@@ -129,6 +138,26 @@ def resolve_model_path(path_str: str) -> str:
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if isinstance(model, DDP) else model
+
+
+def spikes_penalty(model: torch.nn.Module) -> torch.Tensor | None:
+    total: torch.Tensor | None = None
+    for module in model.modules():
+        if isinstance(module, QuantLinear) and module.last_penalty is not None:
+            total = module.last_penalty if total is None else total + module.last_penalty
+    return total
+
+
+def quant_max_activation(model: torch.nn.Module) -> tuple[float | None, str | None]:
+    best_val: float | None = None
+    best_name: str | None = None
+    for module in model.modules():
+        if isinstance(module, QuantLinear) and module.last_max_act is not None:
+            val = float(module.last_max_act)
+            if (best_val is None) or (val > best_val):
+                best_val = val
+                best_name = getattr(module, "q_name", module.__class__.__name__)
+    return best_val, best_name
 
 
 def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> LlamaForCausalLM:
@@ -172,9 +201,10 @@ def prepare_quant_layers(
                 quant.weight = linear_module.weight
                 quant.set_trainable(True)
                 quant.to(linear_module.weight.device)
+                quant.q_name = f"layer{layer_index}.{parent_module.__class__.__name__}.{name}"
                 
                 if set_scales:
-                    quant.set_activation_scale(clip_value)
+                    # quant.set_activation_scale(clip_value)
                     calib_weight_payload = torch.load(weight_calib_path(layer_index, name), map_location="cpu")
                     quant.set_weight_scales(calib_weight_payload.get("scales"))
 
@@ -247,6 +277,20 @@ def compute_token_cross_entropy(
     if mask_sum == 0:
         return torch.tensor(0.0, device=logits.device)
     return (loss * shift_mask).sum() / mask_sum
+
+
+def compute_anchor_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    mask = attention_mask.float()
+    t_top2 = teacher_logits.topk(2, dim=-1).values
+    s_top2 = student_logits.topk(2, dim=-1).values
+    teacher_margin = t_top2[..., 0] - t_top2[..., 1]
+    student_margin = s_top2[..., 0] - s_top2[..., 1]
+    token_loss = torch.relu(teacher_margin - student_margin)
+    return (token_loss * mask).sum() / mask.sum()
 
 
 def run(cfg: Config) -> None:
@@ -348,15 +392,27 @@ def run(cfg: Config) -> None:
         with torch.no_grad():
             teacher_logits = teacher(input_ids=input_ids, attention_mask=attention_mask).logits
 
-        kl_loss = compute_kl_loss(student_logits, teacher_logits, attention_mask)
-        kl_loss.backward()
+        # kl_loss = compute_kl_loss(student_logits, teacher_logits, attention_mask)
+        anchor_loss = compute_anchor_loss(student_logits, teacher_logits, attention_mask)
 
-        student_ce = compute_token_cross_entropy(
-            student_logits.detach(), input_ids, attention_mask
-        )
-        teacher_ce = compute_token_cross_entropy(
-            teacher_logits, input_ids, attention_mask
-        )
+        penalty = spikes_penalty(unwrap_model(student))
+        if penalty is not None and cfg.penalty_scale > 0:
+            loss = anchor_loss + cfg.penalty_scale * penalty
+            penalty_term = cfg.penalty_scale * penalty
+        else:
+            loss = anchor_loss
+            penalty_term = torch.tensor(0.0, device=loss.device)
+
+        best_act, best_act_name = quant_max_activation(unwrap_model(student))
+
+        loss.backward()
+
+        # student_ce = compute_token_cross_entropy(
+        #     student_logits.detach(), input_ids, attention_mask
+        # )
+        # teacher_ce = compute_token_cross_entropy(
+        #     teacher_logits, input_ids, attention_mask
+        # )
 
         # clip_grad_norm_(student.parameters(), max_norm=1.0)
         optimizer.step()
@@ -370,10 +426,15 @@ def run(cfg: Config) -> None:
             else:
                 data_time_ema = 0.9 * data_time_ema + 0.1 * data_time
                 step_time_ema = 0.9 * step_time_ema + 0.1 * step_time
-            student_ppl = math.exp(student_ce)
-            teacher_ppl = math.exp(teacher_ce)
+            # student_ppl = math.exp(student_ce)
+            # teacher_ppl = math.exp(teacher_ce)
+            max_act_val = best_act if best_act is not None else 0.0
+            max_act_name = best_act_name if best_act_name is not None else "n/a"
             progress.set_postfix_str(
-                f"[kl_loss={kl_loss.item():9.6f}, student_ppl={student_ppl:7.2f}, teacher_ppl={teacher_ppl:7.2f}, data={data_time_ema*1000:.0f}ms, step={step_time_ema:.2f}s]"
+                f"[anchor_loss={anchor_loss.item():9.6f}, penalty={penalty_term.item():9.6f}, "
+                f"max_act={max_act_val:9.6f} ({max_act_name}), "
+                # f"student_ppl={student_ppl:7.2f}, teacher_ppl={teacher_ppl:7.2f}, "
+                # f"data={data_time_ema*1000:.0f}ms, step={step_time_ema:.2f}s]"
             )
 
         if cfg.checkpoint_interval > 0 and (step + 1) % cfg.checkpoint_interval == 0:
