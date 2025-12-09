@@ -83,8 +83,12 @@ class QuantLinear(nn.Module):
         # return F.linear(x_q, w_q)
         y = F.linear(x, self.weight)
         out_penalty = F.softplus(y.abs() - clip_t).square().mean()
-        self.last_penalty = act_penalty + out_penalty
-        self.last_max_act = torch.max(x.detach().abs().max(), y.detach().abs().max())
+        # Max-based penalty on the single worst activation (smooth for gradient flow)
+        max_val = torch.max(x.abs().max(), y.abs().max())
+        max_penalty = F.softplus(max_val - clip_t)
+
+        self.last_penalty = act_penalty + out_penalty + max_penalty
+        self.last_max_act = max_val.detach()
         return y
 
     def set_activation_scale(self, clip_value: float) -> None:

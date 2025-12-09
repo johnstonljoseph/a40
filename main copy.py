@@ -22,9 +22,9 @@ DIR = Path(__file__).resolve().parent
 
 @dataclass
 class Config:
-    steps: int = 4000
-    batch_size: int = 128 // 8
-    seq_len: int = 256
+    steps: int = 8000
+    batch_size: int = 8
+    seq_len: int = 512
     lr: float = 5e-6
     device: str = "cuda"
     dtype: str = "bfloat16"
@@ -41,8 +41,6 @@ class Config:
     starting_step: int = 0
     train_layers: tuple[int, ...] = field(default_factory=tuple)
     penalty_scale: float = 1
-    margin_weight: float = 1.0
-    align_weight: float = 1.0
 
 
 def parse_args() -> Config:
@@ -92,18 +90,6 @@ def parse_args() -> Config:
         default=Config.penalty_scale,
         help="Multiplier for quant weight penalty loss.",
     )
-    parser.add_argument(
-        "--margin-weight",
-        type=float,
-        default=Config.margin_weight,
-        help="Weight for margin component in anchor loss.",
-    )
-    parser.add_argument(
-        "--align-weight",
-        type=float,
-        default=Config.align_weight,
-        help="Weight for align (teacher top-1) component in anchor loss.",
-    )
     args = parser.parse_args()
     raw_train_layers = args.train_layers.strip()
     train_layers = tuple(int(tok) for tok in raw_train_layers.split(",") if tok.strip())
@@ -117,8 +103,6 @@ def parse_args() -> Config:
         device=args.device,
         dtype=args.dtype,
         penalty_scale=args.weight_penalty_scale,
-        margin_weight=args.margin_weight,
-        align_weight=args.align_weight,
     )
 
 
@@ -155,14 +139,11 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
-def spikes_penalty(model: torch.nn.Module) -> torch.Tensor:
-    """Aggregate quant penalties; always returns a tensor on model device."""
-    first_param = next(model.parameters(), None)
-    device = first_param.device if first_param is not None else torch.device("cpu")
-    total = torch.tensor(0.0, device=device)
+def spikes_penalty(model: torch.nn.Module) -> torch.Tensor | None:
+    total: torch.Tensor | None = None
     for module in model.modules():
         if isinstance(module, QuantLinear) and module.last_penalty is not None:
-            total += module.last_penalty
+            total = module.last_penalty if total is None else total + module.last_penalty
     return total
 
 
@@ -301,57 +282,14 @@ def compute_anchor_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
     attention_mask: torch.Tensor,
-    margin_weight: float = 1.0,
-    align_weight: float = 1.0,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
+) -> torch.Tensor:
     mask = attention_mask.float()
     t_top2 = teacher_logits.topk(2, dim=-1).values
-    s_top2_vals, s_top2_idx = student_logits.topk(2, dim=-1)
+    s_top2 = student_logits.topk(2, dim=-1).values
     teacher_margin = t_top2[..., 0] - t_top2[..., 1]
-    student_margin = s_top2_vals[..., 0] - s_top2_vals[..., 1]
-    margin_loss = torch.relu(teacher_margin - student_margin)
-
-    temp = 20.0
-    teacher_idx = teacher_logits.argmax(dim=-1)
-    student_log_probs = F.log_softmax(student_logits / temp, dim=-1)
-    align_loss = -student_log_probs.gather(-1, teacher_idx.unsqueeze(-1)).squeeze(-1)
-
-    denom = mask.sum()
-    token_loss = margin_weight * margin_loss + align_weight * align_loss
-    margin = (margin_loss * mask).sum() / denom
-    align = (align_loss * mask).sum() / denom
-
-    grad_margin = torch.autograd.grad(margin, student_logits, retain_graph=True)[0]
-    grad_align = torch.autograd.grad(align, student_logits, retain_graph=True)[0]
-
-    grad_margin_top = grad_margin.gather(-1, s_top2_idx)
-    grad_margin_top1 = (grad_margin_top[..., 0] * mask).sum() / denom
-    grad_margin_top2 = (grad_margin_top[..., 1] * mask).sum() / denom
-
-    grad_align_top = (grad_align.gather(-1, teacher_idx.unsqueeze(-1)).squeeze(-1) * mask).sum() / denom
-
-    grad_margin_norm = torch.sqrt((grad_margin.pow(2).sum(dim=-1) * mask).sum() / denom)
-    grad_align_norm = torch.sqrt((grad_align.pow(2).sum(dim=-1) * mask).sum() / denom)
-
-    return (
-        (token_loss * mask).sum() / denom,
-        margin,
-        align,
-        grad_margin_top1,
-        grad_margin_top2,
-        grad_align_top,
-        grad_margin_norm,
-        grad_align_norm,
-    )
+    student_margin = s_top2[..., 0] - s_top2[..., 1]
+    token_loss = torch.relu(teacher_margin - student_margin)
+    return (token_loss * mask).sum() / mask.sum()
 
 
 def run(cfg: Config) -> None:
@@ -434,63 +372,39 @@ def run(cfg: Config) -> None:
         initial=start_step,
         total=cfg.steps,
         desc="distill",
-        bar_format="{desc}: |{bar}| {n_fmt}/{total_fmt} {postfix}",
-        dynamic_ncols=True,
-        ncols=140,
+        bar_format="{desc}: |{bar}| {n_fmt}/{total_fmt}{postfix}",
         disable=(rank != 0),
     )
 
     for step in progress:
+        step_start = time.perf_counter()
         optimizer.zero_grad()
 
+        data_start = time.perf_counter()
         batch = next(batch_iter)
+        data_time = time.perf_counter() - data_start
 
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         student_logits = student(input_ids=input_ids, attention_mask=attention_mask).logits
-        # Keep logits grad for logging
-        student_logits.retain_grad()
 
         with torch.no_grad():
             teacher_logits = teacher(input_ids=input_ids, attention_mask=attention_mask).logits
 
-        (
-            anchor_loss,
-            margin_loss,
-            align_loss,
-            grad_margin_top1,
-            grad_margin_top2,
-            grad_align_top,
-            grad_margin_norm,
-            grad_align_norm,
-        ) = compute_anchor_loss(
-            student_logits,
-            teacher_logits,
-            attention_mask,
-            margin_weight=cfg.margin_weight,
-            align_weight=cfg.align_weight,
-        )
+        # kl_loss = compute_kl_loss(student_logits, teacher_logits, attention_mask)
+        anchor_loss = compute_anchor_loss(student_logits, teacher_logits, attention_mask)
 
         penalty = spikes_penalty(unwrap_model(student))
-        penalty_term = cfg.penalty_scale * penalty
-        loss = anchor_loss + penalty_term
+        if penalty is not None and cfg.penalty_scale > 0:
+            loss = anchor_loss + cfg.penalty_scale * penalty
+            penalty_term = cfg.penalty_scale * penalty
+        else:
+            loss = anchor_loss
+            penalty_term = torch.tensor(0.0, device=loss.device)
 
         best_act, best_act_name = quant_max_activation(unwrap_model(student))
 
         loss.backward()
-
-        # Overall gradient norms
-        with torch.no_grad():
-            logits_grad_norm = (
-                student_logits.grad.norm().detach()
-                if student_logits.grad is not None
-                else torch.tensor(0.0, device=device)
-            )
-            param_sq_sum = torch.zeros(1, device=device)
-            for p in student.parameters():
-                if p.grad is not None:
-                    param_sq_sum += p.grad.pow(2).sum()
-            param_grad_norm = param_sq_sum.sqrt()
 
         # student_ce = compute_token_cross_entropy(
         #     student_logits.detach(), input_ids, attention_mask
@@ -502,6 +416,7 @@ def run(cfg: Config) -> None:
         # clip_grad_norm_(student.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
+        step_time = time.perf_counter() - step_start
 
         if rank == 0:
             if data_time_ema is None:
@@ -515,12 +430,10 @@ def run(cfg: Config) -> None:
             max_act_val = best_act if best_act is not None else 0.0
             max_act_name = best_act_name if best_act_name is not None else "n/a"
             progress.set_postfix_str(
-                (
-                    f"align={align_loss.item():.4f} margin={margin_loss.item():.4f} "
-                    f"|g_align|={grad_align_norm.item():.4f} |g_margin|={grad_margin_norm.item():.4f} "
-                    f"penalty={penalty_term.item():.4f} max_act={max_act_val:.4f}({max_act_name}) "
-                    f"logit_gn={logits_grad_norm.item():.4f} param_gn={param_grad_norm.item():.4f} "
-                )
+                f"[anchor_loss={anchor_loss.item():9.6f}, penalty={penalty_term.item():9.6f}, "
+                f"max_act={max_act_val:9.6f} ({max_act_name}), "
+                # f"student_ppl={student_ppl:7.2f}, teacher_ppl={teacher_ppl:7.2f}, "
+                # f"data={data_time_ema*1000:.0f}ms, step={step_time_ema:.2f}s]"
             )
 
         if cfg.checkpoint_interval > 0 and (step + 1) % cfg.checkpoint_interval == 0:
