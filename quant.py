@@ -74,20 +74,17 @@ class QuantLinear(nn.Module):
         self.last_max_act: torch.Tensor | None = None
 
     def forward(self, x):
-        clip_t = 12.0
-        act_penalty = F.softplus(x.abs() - clip_t).square().mean()
+        clip_t = 32.0
         act_scale = self.log_act_s.exp().to(x.dtype)
         weight_scale = self.log_weight_s.exp().to(self.weight.dtype)
-        # x_q = QuantFn.apply(x, act_scale, self.qmax)
-        # w_q = QuantFn.apply(self.weight, weight_scale, self.qmax)
-        # return F.linear(x_q, w_q)
-        y = F.linear(x, self.weight)
-        out_penalty = F.softplus(y.abs() - clip_t).square().mean()
+        x_q = QuantFn.apply(x, act_scale, self.qmax)
+        w_q = QuantFn.apply(self.weight, weight_scale, self.qmax)
+        y = F.linear(x_q, w_q)
         # Max-based penalty on the single worst activation (smooth for gradient flow)
         max_val = torch.max(x.abs().max(), y.abs().max())
         max_penalty = F.softplus(max_val - clip_t)
 
-        self.last_penalty = act_penalty + out_penalty + max_penalty
+        self.last_penalty = max_penalty
         self.last_max_act = max_val.detach()
         return y
 
@@ -105,7 +102,6 @@ class QuantLinear(nn.Module):
             self.log_weight_s.copy_(target.log())
 
     def set_trainable(self, enabled: bool) -> None:
-        None
-        # self.weight.requires_grad = enabled
-        # self.log_weight_s.requires_grad = enabled
-        # self.log_act_s.requires_grad = enabled
+        self.weight.requires_grad = enabled
+        self.log_weight_s.requires_grad = enabled
+        self.log_act_s.requires_grad = enabled

@@ -22,9 +22,9 @@ DIR = Path(__file__).resolve().parent
 
 @dataclass
 class Config:
-    steps: int = 4000
-    batch_size: int = 128 // 8
-    seq_len: int = 256
+    steps: int = 10000
+    batch_size: int = 16
+    seq_len: int = 1024
     lr: float = 5e-6
     device: str = "cuda"
     dtype: str = "bfloat16"
@@ -32,17 +32,17 @@ class Config:
     # base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
-    dataset_ratio_a: float = 0.75
+    dataset_ratio_a: float = 0.60
     dataset_split: str = "train"
     shuffle_buffer_size: int = 10_000
     seed: int = 0
-    num_workers: int = 0
+    num_workers: int = 1
     checkpoint_interval: int = 2000
     starting_step: int = 0
     train_layers: tuple[int, ...] = field(default_factory=tuple)
-    penalty_scale: float = 1
-    margin_weight: float = 1.0
-    align_weight: float = 1.0
+    penalty_scale: float = 0
+    margin_weight: float = 0.0
+    align_weight: float = 32.0
 
 
 def parse_args() -> Config:
@@ -222,7 +222,7 @@ def prepare_quant_layers(
                 quant.q_name = f"layer{layer_index}.{parent_module.__class__.__name__}.{name}"
                 
                 if set_scales:
-                    # quant.set_activation_scale(clip_value)
+                    quant.set_activation_scale(clip_value)
                     calib_weight_payload = torch.load(weight_calib_path(layer_index, name), map_location="cpu")
                     quant.set_weight_scales(calib_weight_payload.get("scales"))
 
@@ -301,57 +301,91 @@ def compute_anchor_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
     attention_mask: torch.Tensor,
-    margin_weight: float = 1.0,
     align_weight: float = 1.0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
 ]:
     mask = attention_mask.float()
-    t_top2 = teacher_logits.topk(2, dim=-1).values
-    s_top2_vals, s_top2_idx = student_logits.topk(2, dim=-1)
-    teacher_margin = t_top2[..., 0] - t_top2[..., 1]
-    student_margin = s_top2_vals[..., 0] - s_top2_vals[..., 1]
-    margin_loss = torch.relu(teacher_margin - student_margin)
-
-    temp = 20.0
+    temp = 4.0
     teacher_idx = teacher_logits.argmax(dim=-1)
     student_log_probs = F.log_softmax(student_logits / temp, dim=-1)
     align_loss = -student_log_probs.gather(-1, teacher_idx.unsqueeze(-1)).squeeze(-1)
 
     denom = mask.sum()
-    token_loss = margin_weight * margin_loss + align_weight * align_loss
-    margin = (margin_loss * mask).sum() / denom
     align = (align_loss * mask).sum() / denom
 
-    grad_margin = torch.autograd.grad(margin, student_logits, retain_graph=True)[0]
     grad_align = torch.autograd.grad(align, student_logits, retain_graph=True)[0]
-
-    grad_margin_top = grad_margin.gather(-1, s_top2_idx)
-    grad_margin_top1 = (grad_margin_top[..., 0] * mask).sum() / denom
-    grad_margin_top2 = (grad_margin_top[..., 1] * mask).sum() / denom
-
     grad_align_top = (grad_align.gather(-1, teacher_idx.unsqueeze(-1)).squeeze(-1) * mask).sum() / denom
-
-    grad_margin_norm = torch.sqrt((grad_margin.pow(2).sum(dim=-1) * mask).sum() / denom)
     grad_align_norm = torch.sqrt((grad_align.pow(2).sum(dim=-1) * mask).sum() / denom)
 
     return (
-        (token_loss * mask).sum() / denom,
-        margin,
+        (align_weight * align_loss * mask).sum() / denom,
         align,
-        grad_margin_top1,
-        grad_margin_top2,
         grad_align_top,
-        grad_margin_norm,
         grad_align_norm,
     )
+
+
+def argmax_stability_metrics(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    attention_mask: torch.Tensor,
+    tau: float = 0.7,
+    eps: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """Alignment diagnostics on masked tokens."""
+    token_mask = attention_mask.bool()
+    num_tokens = token_mask.sum()
+    if num_tokens == 0:
+        zero = torch.tensor(0.0, device=teacher_logits.device)
+        return {
+            "top1_acc": zero,
+            "avg_flip_penalty": zero,
+            "median_rel_margin": zero,
+            "avg_flip_severity": zero,
+        }
+
+    t_flat = teacher_logits[token_mask]  # [N, V]
+    s_flat = student_logits[token_mask]
+
+    top2 = t_flat.topk(2, dim=-1)
+    idx_top1 = top2.indices[:, 0]
+    idx_top2 = top2.indices[:, 1]
+
+    zi = t_flat.gather(-1, idx_top1[:, None]).squeeze(-1)
+    zj = t_flat.gather(-1, idx_top2[:, None]).squeeze(-1)
+    m = zi - zj
+
+    zhi = s_flat.gather(-1, idx_top1[:, None]).squeeze(-1)
+    zhj = s_flat.gather(-1, idx_top2[:, None]).squeeze(-1)
+    mhat = zhi - zhj
+
+    student_top1 = s_flat.argmax(dim=-1)
+    top1_correct = student_top1 == idx_top1
+    top1_acc = top1_correct.float().mean()
+
+    flip_penalty = (~top1_correct) * torch.tanh(m / tau)
+    avg_flip_penalty = flip_penalty.mean()
+
+    rel_margin = mhat / (m + eps)
+    rel_margin_aligned = rel_margin[top1_correct]
+    if rel_margin_aligned.numel() == 0:
+        median_rel_margin = torch.tensor(0.0, device=teacher_logits.device)
+    else:
+        median_rel_margin = rel_margin_aligned.median()
+
+    k = student_top1
+    zhk = s_flat.gather(-1, k[:, None]).squeeze(-1)
+    flip_severity = torch.clamp(zhk - zhi, min=0.0)
+    avg_flip_severity = flip_severity.mean()
+
+    return {
+        "top1_acc": top1_acc,
+        "avg_flip_penalty": avg_flip_penalty,
+        "median_rel_margin": median_rel_margin,
+        "avg_flip_severity": avg_flip_severity,
+    }
 
 
 def run(cfg: Config) -> None:
@@ -382,6 +416,9 @@ def run(cfg: Config) -> None:
         print("[run] loading student model...", flush=True)
     student = copy.deepcopy(teacher)
     freeze_model(teacher)
+    # Freeze only embedding and lm_head, train everything else
+    student.model.embed_tokens.requires_grad_(False)
+    student.lm_head.requires_grad_(False)
     prepare_quant_layers(
         student.model,
         cfg.train_layers,
@@ -426,8 +463,13 @@ def run(cfg: Config) -> None:
         rank,
     ))
 
-    data_time_ema: float | None = None
-    step_time_ema: float | None = None
+    ema_miss: float | None = None
+    log_path = DIR / "logs" / "top1_miss.csv"
+    if rank == 0:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not log_path.exists():
+            with open(log_path, "w") as f:
+                f.write("step,top1_miss,ema_miss,top1_acc,flip_penalty,median_rel_margin,flip_severity\n")
 
     progress = tqdm(
         range(start_step, cfg.steps),
@@ -456,24 +498,26 @@ def run(cfg: Config) -> None:
 
         (
             anchor_loss,
-            margin_loss,
             align_loss,
-            grad_margin_top1,
-            grad_margin_top2,
             grad_align_top,
-            grad_margin_norm,
             grad_align_norm,
         ) = compute_anchor_loss(
             student_logits,
             teacher_logits,
             attention_mask,
-            margin_weight=cfg.margin_weight,
             align_weight=cfg.align_weight,
         )
 
-        penalty = spikes_penalty(unwrap_model(student))
-        penalty_term = cfg.penalty_scale * penalty
-        loss = anchor_loss + penalty_term
+        with torch.no_grad():
+            metrics = argmax_stability_metrics(teacher_logits, student_logits, attention_mask)
+            top1_acc = metrics["top1_acc"]
+            top1_miss = 1.0 - top1_acc
+            flip_penalty = metrics["avg_flip_penalty"]
+            median_rel_margin = metrics["median_rel_margin"]
+            flip_severity = metrics["avg_flip_severity"]
+
+        # penalty_term = torch.tensor(0.0, device=device)
+        loss = anchor_loss
 
         best_act, best_act_name = quant_max_activation(unwrap_model(student))
 
@@ -492,33 +536,29 @@ def run(cfg: Config) -> None:
                     param_sq_sum += p.grad.pow(2).sum()
             param_grad_norm = param_sq_sum.sqrt()
 
-        # student_ce = compute_token_cross_entropy(
-        #     student_logits.detach(), input_ids, attention_mask
-        # )
-        # teacher_ce = compute_token_cross_entropy(
-        #     teacher_logits, input_ids, attention_mask
-        # )
-
-        # clip_grad_norm_(student.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
 
         if rank == 0:
-            if data_time_ema is None:
-                data_time_ema = data_time
-                step_time_ema = step_time
-            else:
-                data_time_ema = 0.9 * data_time_ema + 0.1 * data_time
-                step_time_ema = 0.9 * step_time_ema + 0.1 * step_time
-            # student_ppl = math.exp(student_ce)
-            # teacher_ppl = math.exp(teacher_ce)
+            # Update EMA of top1_miss
+            ema_miss = top1_miss.item() if ema_miss is None else 0.9 * ema_miss + 0.1 * top1_miss.item()
+            # Append to CSV log (rank0)
+            with open(log_path, "a") as f:
+                f.write(
+                    f"{step},{top1_miss.item():.6f},{ema_miss:.6f},"
+                    f"{top1_acc.item():.6f},{flip_penalty.item():.6f},"
+                    f"{median_rel_margin.item():.6f},{flip_severity.item():.6f}\n"
+                )
             max_act_val = best_act if best_act is not None else 0.0
             max_act_name = best_act_name if best_act_name is not None else "n/a"
             progress.set_postfix_str(
                 (
-                    f"align={align_loss.item():.4f} margin={margin_loss.item():.4f} "
-                    f"|g_align|={grad_align_norm.item():.4f} |g_margin|={grad_margin_norm.item():.4f} "
-                    f"penalty={penalty_term.item():.4f} max_act={max_act_val:.4f}({max_act_name}) "
+                    f"align={align_loss.item():.4f} "
+                    f"|g_align|={grad_align_norm.item():.2e} "
+                    f"max_act={max_act_val:.4f}({max_act_name}) "
+                    f"top1_miss={top1_miss.item():.3f} ema_miss={ema_miss:.3f} "
+                    f"flip_pen={flip_penalty.item():.3f} rel_median={median_rel_margin.item():.3f} "
+                    f"flip_sev={flip_severity.item():.3f} "
                     f"logit_gn={logits_grad_norm.item():.4f} param_gn={param_grad_norm.item():.4f} "
                 )
             )
