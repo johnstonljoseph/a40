@@ -95,18 +95,18 @@ def build_dataloader(
     )
     if rank == 0:
         print(f"[data] dataset A ready", flush=True)
-    ds_b = to_text_stream(
-        datasets.load_dataset(cfg.dataset_b, split="train", streaming=True),
-        tokenizer,
-    )
-    if rank == 0:
-        print(f"[data] dataset B ready", flush=True)
+    # ds_b = to_text_stream(
+    #     datasets.load_dataset(cfg.dataset_b, split="train", streaming=True),
+    #     tokenizer,
+    # )
+    # if rank == 0:
+    #     print(f"[data] dataset B ready", flush=True)
 
     stream = datasets.interleave_datasets(
-        [ds_a, ds_b],
-        probabilities=[cfg.dataset_ratio_a, 1.0 - cfg.dataset_ratio_a],
-        # [ds_a],
-        # probabilities=[1.0],
+        # [ds_a, ds_b],
+        # probabilities=[cfg.dataset_ratio_a, 1.0 - cfg.dataset_ratio_a],
+        [ds_a],
+        probabilities=[1.0],
         seed=cfg.seed,
     )
     stream = stream.shuffle(buffer_size=cfg.shuffle_buffer_size, seed=cfg.seed)

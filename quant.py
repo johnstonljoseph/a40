@@ -70,21 +70,16 @@ class QuantLinear(nn.Module):
 
         self.log_act_s = nn.Parameter(torch.empty(()))
         self.log_weight_s = nn.Parameter(torch.empty(out_features, 1))
-        self.last_penalty: torch.Tensor | None = None
         self.last_max_act: torch.Tensor | None = None
 
     def forward(self, x):
-        clip_t = 32.0
         act_scale = self.log_act_s.exp().to(x.dtype)
         weight_scale = self.log_weight_s.exp().to(self.weight.dtype)
         x_q = QuantFn.apply(x, act_scale, self.qmax)
         w_q = QuantFn.apply(self.weight, weight_scale, self.qmax)
         y = F.linear(x_q, w_q)
-        # Max-based penalty on the single worst activation (smooth for gradient flow)
         max_val = torch.max(x.abs().max(), y.abs().max())
-        max_penalty = F.softplus(max_val - clip_t)
 
-        self.last_penalty = max_penalty
         self.last_max_act = max_val.detach()
         return y
 

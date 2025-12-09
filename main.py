@@ -6,6 +6,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import time
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from dataclasses import dataclass, field
@@ -23,8 +25,9 @@ DIR = Path(__file__).resolve().parent
 @dataclass
 class Config:
     steps: int = 10000
-    batch_size: int = 20
+    batch_size: int = 3
     seq_len: int = 1024
+    accumulate_steps: int = 5
     lr: float = 5e-6
     device: str = "cuda"
     dtype: str = "bfloat16"
@@ -33,7 +36,7 @@ class Config:
     # base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
     dataset_a: str = "allenai/tulu-3-sft-mixture"
     dataset_b: str = "mlfoundations/dclm-baseline-1.0"
-    dataset_ratio_a: float = 0.5
+    dataset_ratio_a: float = 0.75
     dataset_split: str = "train"
     shuffle_buffer_size: int = 10_000
     seed: int = 0
@@ -41,9 +44,7 @@ class Config:
     checkpoint_interval: int = 2000
     starting_step: int = 0
     train_layers: Optional[tuple[int, ...]] = field(default=None)
-    penalty_scale: float = 0
-    margin_weight: float = 0.0
-    align_weight: float = 32.0
+    compile: bool = True
 
 
 def parse_args() -> Config:
@@ -57,6 +58,9 @@ def parse_args() -> Config:
         default=Config.seq_len,
         help="Sequence length for packed training batches",
     )
+    parser.add_argument("--shuffle-buffer-size", type=int, default=Config.shuffle_buffer_size)
+    parser.add_argument("--seed", type=int, default=Config.seed)
+    parser.add_argument("--num-workers", type=int, default=Config.num_workers)
     parser.add_argument(
         "--train-layers",
         type=str,
@@ -88,22 +92,23 @@ def parse_args() -> Config:
         help="Torch dtype for loading models (e.g., float32, bfloat16).",
     )
     parser.add_argument(
-        "--weight-penalty-scale",
-        type=float,
-        default=Config.penalty_scale,
-        help="Multiplier for quant weight penalty loss.",
+        "--accumulate-steps",
+        type=int,
+        default=Config.accumulate_steps,
+        help="Number of micro-batches to accumulate before an optimizer step.",
     )
     parser.add_argument(
-        "--margin-weight",
-        type=float,
-        default=Config.margin_weight,
-        help="Weight for margin component in anchor loss.",
+        "--compile",
+        dest="compile",
+        action="store_true",
+        default=Config.compile,
+        help="Use torch.compile on the student model for speed (may increase startup time).",
     )
     parser.add_argument(
-        "--align-weight",
-        type=float,
-        default=Config.align_weight,
-        help="Weight for align (teacher top-1) component in anchor loss.",
+        "--no-compile",
+        dest="compile",
+        action="store_false",
+        help="Disable torch.compile even if default is on.",
     )
     args = parser.parse_args()
     raw_train_layers = args.train_layers.strip()
@@ -116,14 +121,15 @@ def parse_args() -> Config:
         steps=args.steps,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
-        train_layers=train_layers,
+        shuffle_buffer_size=args.shuffle_buffer_size,
+        seed=args.seed,
+        num_workers=args.num_workers,
         checkpoint_interval=args.checkpoint_interval,
         starting_step=args.starting_step,
-        device=args.device,
+        train_layers=train_layers,
+        compile=args.compile,
         dtype=args.dtype,
-        penalty_scale=args.weight_penalty_scale,
-        margin_weight=args.margin_weight,
-        align_weight=args.align_weight,
+        accumulate_steps=args.accumulate_steps,
     )
 
 
@@ -158,17 +164,6 @@ def resolve_model_path(path_str: str) -> str:
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if isinstance(model, DDP) else model
-
-
-def spikes_penalty(model: torch.nn.Module) -> torch.Tensor:
-    """Aggregate quant penalties; always returns a tensor on model device."""
-    first_param = next(model.parameters(), None)
-    device = first_param.device if first_param is not None else torch.device("cpu")
-    total = torch.tensor(0.0, device=device)
-    for module in model.modules():
-        if isinstance(module, QuantLinear) and module.last_penalty is not None:
-            total += module.last_penalty
-    return total
 
 
 def quant_max_activation(model: torch.nn.Module) -> tuple[float | None, str | None]:
@@ -270,6 +265,32 @@ def load_checkpoint(
         scheduler.load_state_dict(ckpt["scheduler"])
 
 
+def ensure_adamw_state_dtype(optimizer: torch.optim.AdamW, target_dtype: torch.dtype) -> None:
+    """Make sure AdamW moment tensors live in the desired dtype (bf16 support)."""
+    if target_dtype != torch.bfloat16:
+        return
+
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param is None or not param.requires_grad:
+                continue
+            state = optimizer.state[param]
+            if "exp_avg" in state:
+                state["exp_avg"] = state["exp_avg"].to(dtype=target_dtype)
+            else:
+                state["exp_avg"] = torch.zeros_like(
+                    param, dtype=target_dtype, memory_format=torch.preserve_format
+                )
+            if "exp_avg_sq" in state:
+                state["exp_avg_sq"] = state["exp_avg_sq"].to(dtype=target_dtype)
+            else:
+                state["exp_avg_sq"] = torch.zeros_like(
+                    param, dtype=target_dtype, memory_format=torch.preserve_format
+                )
+            if "step" not in state:
+                state["step"] = torch.zeros((), device=param.device, dtype=torch.int64)
+
+
 def compute_kl_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
@@ -301,35 +322,6 @@ def compute_token_cross_entropy(
         return torch.tensor(0.0, device=logits.device)
     return (loss * shift_mask).sum() / mask_sum
 
-
-def compute_anchor_loss(
-    student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    attention_mask: torch.Tensor,
-    align_weight: float = 1.0,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-]:
-    mask = attention_mask.float()
-    temp = 4.0
-    teacher_idx = teacher_logits.argmax(dim=-1)
-    student_log_probs = F.log_softmax(student_logits / temp, dim=-1)
-    align_loss = -student_log_probs.gather(-1, teacher_idx.unsqueeze(-1)).squeeze(-1)
-
-    denom = mask.sum()
-    align = (align_loss * mask).sum() / denom
-
-    grad_align = torch.autograd.grad(align, student_logits, retain_graph=True)[0]
-    grad_align_top = (grad_align.gather(-1, teacher_idx.unsqueeze(-1)).squeeze(-1) * mask).sum() / denom
-    grad_align_norm = torch.sqrt((grad_align.pow(2).sum(dim=-1) * mask).sum() / denom)
-
-    return (
-        (align_weight * align_loss * mask).sum() / denom,
-        align,
-        grad_align_top,
-        grad_align_norm,
-    )
 
 
 def argmax_stability_metrics(
@@ -419,11 +411,8 @@ def run(cfg: Config) -> None:
 
     if rank == 0:
         print("[run] loading student model...", flush=True)
-    student = copy.deepcopy(teacher)
     freeze_model(teacher)
-    # Freeze only embedding and lm_head, train everything else
-    student.model.embed_tokens.requires_grad_(False)
-    student.lm_head.requires_grad_(False)
+    student = copy.deepcopy(teacher)
     target_layers = cfg.train_layers
     if target_layers is None:
         target_layers = tuple(range(len(student.model.layers)))
@@ -433,18 +422,48 @@ def run(cfg: Config) -> None:
         cfg.starting_step == 0
     )
 
+    if cfg.compile:
+        if rank == 0:
+            print("[run] compiling student with torch.compile...", flush=True)
+        student = torch.compile(
+            student,
+            fullgraph=False,
+            options={"triton.cudagraphs": False},  # avoid cudagraph capture issues
+        )
+        if rank == 0:
+            print("[run] student compile finished", flush=True)
+
+    # Cut activation memory; safe with grad accumulation
+    # student.gradient_checkpointing_enable()
+
     if distributed:
         student = DDP(student, device_ids=[rank], output_device=rank)
+
+    # Separate LR for activation scales (log_act_s): 50x base LR
+    act_params: list[torch.nn.Parameter] = []
+    other_params: list[torch.nn.Parameter] = []
+    for name, param in student.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.endswith("log_act_s"):
+            act_params.append(param)
+        else:
+            other_params.append(param)
 
     beta2 = 0.95 if use_bf16 else 0.999
     eps = 1e-10 if use_bf16 else 1e-8
     optimizer = torch.optim.AdamW(
-        student.parameters(),
+        [
+            {"params": other_params, "lr": cfg.lr},
+            {"params": act_params, "lr": cfg.lr * 50.0},
+        ],
         lr=cfg.lr,
         betas=(0.9, beta2),
         eps=eps,
         weight_decay=0.1,
+        foreach=False,  # avoid multi-tensor grouping dtype issues with bf16 state casting
     )
+    ensure_adamw_state_dtype(optimizer, dtype)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.steps, eta_min=cfg.lr * 0.1
     )
@@ -461,6 +480,7 @@ def run(cfg: Config) -> None:
             scheduler,
             map_location=device,
         )
+        ensure_adamw_state_dtype(optimizer, dtype)
     if rank == 0:
         print(f"[run] resumed from step {start_step}")
 
@@ -477,7 +497,7 @@ def run(cfg: Config) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         if not log_path.exists():
             with open(log_path, "w") as f:
-                f.write("step,top1_miss,ema_miss,top1_acc,flip_penalty,median_rel_margin,flip_severity\n")
+                f.write("step,kl,top1_miss,ema_miss,top1_acc,flip_penalty,median_rel_margin,flip_severity,max_act,max_act_name\n")
 
     progress = tqdm(
         range(start_step, cfg.steps),
@@ -490,100 +510,98 @@ def run(cfg: Config) -> None:
         disable=(rank != 0),
     )
 
+    log_interval = 12  # reuse checkpoint interval semantics
+
+    last_kl: torch.Tensor | None = None
+    last_top1_miss: torch.Tensor | None = None
+    last_top1_acc: torch.Tensor | None = None
+    last_flip_penalty: torch.Tensor | None = None
+    last_median_rel_margin: torch.Tensor | None = None
+    last_flip_severity: torch.Tensor | None = None
+    last_max_act: float | None = None
+    last_max_act_name: str | None = None
+
     for step in progress:
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
-        batch = next(batch_iter)
+        # Gradient accumulation over micro-batches
+        for micro in range(cfg.accumulate_steps):
+            batch = next(batch_iter)
 
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        student_logits = student(input_ids=input_ids, attention_mask=attention_mask).logits
-        # Keep logits grad for logging
-        student_logits.retain_grad()
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            student_logits = student(input_ids=input_ids, attention_mask=attention_mask).logits
 
-        with torch.no_grad():
-            teacher_logits = teacher(input_ids=input_ids, attention_mask=attention_mask).logits
+            with torch.no_grad():
+                teacher_logits = teacher(input_ids=input_ids, attention_mask=attention_mask).logits
 
-        (
-            anchor_loss,
-            align_loss,
-            grad_align_top,
-            grad_align_norm,
-        ) = compute_anchor_loss(
-            student_logits,
-            teacher_logits,
-            attention_mask,
-            align_weight=cfg.align_weight,
-        )
+            with torch.no_grad():
+                metrics = argmax_stability_metrics(teacher_logits, student_logits, attention_mask)
+                top1_acc = metrics["top1_acc"]
+                top1_miss = 1.0 - top1_acc
+                flip_penalty = metrics["avg_flip_penalty"]
+                median_rel_margin = metrics["median_rel_margin"]
+                flip_severity = metrics["avg_flip_severity"]
 
-        with torch.no_grad():
-            metrics = argmax_stability_metrics(teacher_logits, student_logits, attention_mask)
-            top1_acc = metrics["top1_acc"]
-            top1_miss = 1.0 - top1_acc
-            flip_penalty = metrics["avg_flip_penalty"]
-            median_rel_margin = metrics["median_rel_margin"]
-            flip_severity = metrics["avg_flip_severity"]
+            kl_loss = compute_kl_loss(student_logits, teacher_logits, attention_mask)
+            best_act, best_act_name = quant_max_activation(unwrap_model(student))
 
-        mask = attention_mask.float()
+            loss = kl_loss / cfg.accumulate_steps
+            loss.backward()
 
-        # Masked MSE on logits
-        mse = ((teacher_logits - student_logits).pow(2).sum(dim=-1) * mask).sum() / mask.sum()
+            # Cache last micro metrics for logging outside the accumulation loop
+            last_kl = kl_loss.detach()
+            last_top1_miss = top1_miss.detach()
+            last_top1_acc = top1_acc.detach()
+            last_flip_penalty = flip_penalty.detach()
+            last_median_rel_margin = median_rel_margin.detach()
+            last_flip_severity = flip_severity.detach()
+            last_max_act = best_act
+            last_max_act_name = best_act_name
 
-        # Masked hard top-1 CE against teacher argmax
-        temp = 4
-        teacher_idx = teacher_logits.argmax(dim=-1)
-        top1 = torch.nn.functional.cross_entropy(
-            (student_logits / temp).view(-1, student_logits.size(-1)),
-            teacher_idx.view(-1),
-            reduction="none",
-        )
-        top1 = (top1 * mask.view(-1)).sum() / mask.sum()
+            # Drop references promptly to release graph memory
+            del teacher_logits, kl_loss, student_logits, loss
 
-        loss = mse + top1
+        # Cast accumulated grads to configured dtype to keep optimizer state consistent
+        for p in student.parameters():
+            if p.grad is not None:
+                p.grad.data = p.grad.data.to(dtype)
 
-        best_act, best_act_name = quant_max_activation(unwrap_model(student))
-
-        loss.backward()
-
-        # Overall gradient norms
-        with torch.no_grad():
-            logits_grad_norm = (
-                student_logits.grad.norm().detach()
-                if student_logits.grad is not None
-                else torch.tensor(0.0, device=device)
-            )
-            param_sq_sum = torch.zeros(1, device=device)
-            for p in student.parameters():
-                if p.grad is not None:
-                    param_sq_sum += p.grad.pow(2).sum()
-            param_grad_norm = param_sq_sum.sqrt()
-
+        if use_bf16:
+            ensure_adamw_state_dtype(optimizer, dtype)
         optimizer.step()
         scheduler.step()
 
-        if rank == 0:
-            # Update EMA of top1_miss
-            ema_miss = top1_miss.item() if ema_miss is None else 0.9 * ema_miss + 0.1 * top1_miss.item()
-            # Append to CSV log (rank0)
+        # Fallbacks if somehow caches are None
+        kl_val = last_kl.item() if last_kl is not None else 0.0
+        top1_miss_val = last_top1_miss.item() if last_top1_miss is not None else 0.0
+        top1_acc_val = last_top1_acc.item() if last_top1_acc is not None else 0.0
+        flip_pen_val = last_flip_penalty.item() if last_flip_penalty is not None else 0.0
+        median_rel_val = last_median_rel_margin.item() if last_median_rel_margin is not None else 0.0
+        flip_sev_val = last_flip_severity.item() if last_flip_severity is not None else 0.0
+        max_act_val = last_max_act if last_max_act is not None else 0.0
+        max_act_name = last_max_act_name if last_max_act_name is not None else "n/a"
+
+        if rank == 0 and ((step + 1) % log_interval == 0 or step == start_step):
+            ema_miss = top1_miss_val if ema_miss is None else 0.9 * ema_miss + 0.1 * top1_miss_val
             with open(log_path, "a") as f:
                 f.write(
-                    f"{step},{top1_miss.item():.6f},{ema_miss:.6f},"
-                    f"{top1_acc.item():.6f},{flip_penalty.item():.6f},"
-                    f"{median_rel_margin.item():.6f},{flip_severity.item():.6f}\n"
+                    f"{step},{kl_val:.6f},{top1_miss_val:.6f},{ema_miss:.6f},"
+                    f"{top1_acc_val:.6f},{flip_pen_val:.6f},"
+                    f"{median_rel_val:.6f},{flip_sev_val:.6f},"
+                    f"{max_act_val:.6f},{max_act_name}\n"
                 )
-            max_act_val = best_act if best_act is not None else 0.0
-            max_act_name = best_act_name if best_act_name is not None else "n/a"
-            progress.set_postfix_str(
-                (
-                    f"align={align_loss.item():.4f} "
-                    f"|g_align|={grad_align_norm.item():.2e} "
-                    f"max_act={max_act_val:.4f}({max_act_name}) "
-                    f"top1_miss={top1_miss.item():.3f} ema_miss={ema_miss:.3f} "
-                    f"flip_pen={flip_penalty.item():.3f} rel_median={median_rel_margin.item():.3f} "
-                    f"flip_sev={flip_severity.item():.3f} "
-                    f"logit_gn={logits_grad_norm.item():.4f} param_gn={param_grad_norm.item():.4f} "
-                )
+
+        progress.set_postfix_str(
+            (
+                f"kl={kl_val:.4f} "
+                f"max_act={max_act_val:.4f}({max_act_name}) "
+                f"top1_miss={top1_miss_val:.3f} ema_miss={ema_miss if ema_miss is not None else top1_miss_val:.3f} "
+                f"flip_pen={flip_pen_val:.3f} "
+                f"rel_median={median_rel_val:.3f} "
+                f"flip_sev={flip_sev_val:.3f} "
             )
+        )
 
         if cfg.checkpoint_interval > 0 and (step + 1) % cfg.checkpoint_interval == 0:
             if rank == 0:
