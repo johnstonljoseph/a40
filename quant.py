@@ -37,19 +37,23 @@ class QuantFn(torch.autograd.Function):
     def forward(ctx, x, s, qmax) -> torch.Tensor:
         # x: [batch_size, seq_len, hidden_size]
         # s: [] if per tensor, [out_features] if per channel
+        # x_h = hadamard_transform(x.contiguous())
+        # y = x / s
+        # q = y.clamp(-qmax, qmax-1).round()
+        # xhat_h = q * s
+        # xhat = hadamard_transform(xhat_h.contiguous(), transpose=True)
         y = x / s
         q = y.clamp(-qmax, qmax-1).round()
         xhat = q * s
 
-        ctx.save_for_backward(x, q, s)
+        ctx.save_for_backward(y, q, s)
         ctx.qmax = qmax
         return xhat
 
     @staticmethod
     def backward(ctx, grad_out) -> torch.Tensor:
-        x, q, s = ctx.saved_tensors
+        y, q, s = ctx.saved_tensors
         qmax = ctx.qmax
-        y = x / s
 
         mask = (-qmax <= y) & (y <= qmax-1)
         grad_x = grad_out * mask.to(grad_out.dtype)
@@ -78,6 +82,14 @@ class QuantLinear(nn.Module):
         x_q = QuantFn.apply(x, act_scale, self.qmax)
         w_q = QuantFn.apply(self.weight, weight_scale, self.qmax)
         y = F.linear(x_q, w_q)
+        # y = F.linear(x, w_q)
+
+        # # Dynamically quantize activations and use real-valued weights.
+        # with torch.no_grad():
+        #     max_abs_x = x.detach().abs().amax()
+        #     act_scale = (max_abs_x / self.qmax).clamp(min=torch.finfo(x.dtype).eps)
+        # x_q = QuantFn.apply(x, act_scale.to(dtype=x.dtype, device=x.device), self.qmax)
+        # y = F.linear(x_q, w_q)
         max_val = torch.max(x.abs().max(), y.abs().max())
 
         self.last_max_act = max_val.detach()

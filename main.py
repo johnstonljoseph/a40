@@ -13,7 +13,7 @@ from torch.nn.utils import clip_grad_norm_
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, Sequence
-from transformers import LlamaForCausalLM, LlamaModel
+from transformers.models.olmo3 import Olmo3ForCausalLM, Olmo3Model
 from tqdm.auto import tqdm
 
 from .quant import QuantLinear
@@ -24,23 +24,24 @@ DIR = Path(__file__).resolve().parent
 
 @dataclass
 class Config:
-    steps: int = 10000
-    batch_size: int = 3
+    steps: int = 8000
+    batch_size: int = 5
     seq_len: int = 1024
-    accumulate_steps: int = 5
+    accumulate_steps: int = 16
     lr: float = 5e-6
     device: str = "cuda"
     dtype: str = "bfloat16"
-    base_path: str = "/workspace/.hf_home/hub/models--allenai--Llama-3.1-Tulu-3.1-8B"
-    # models--meta-llama--Llama-3.2-1B-Instruct"
-    # base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    dataset_a: str = "allenai/tulu-3-sft-mixture"
-    dataset_b: str = "mlfoundations/dclm-baseline-1.0"
-    dataset_ratio_a: float = 0.75
-    dataset_split: str = "train"
-    shuffle_buffer_size: int = 10_000
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.4
+    dataset_ratio_dpo: float = 0.3
+    dataset_ratio_rl: float = 0.3
+    shuffle_buffer_size: int = 1000
     seed: int = 0
-    num_workers: int = 1
+    num_workers: int = 0
     checkpoint_interval: int = 2000
     starting_step: int = 0
     train_layers: Optional[tuple[int, ...]] = field(default=None)
@@ -178,8 +179,9 @@ def quant_max_activation(model: torch.nn.Module) -> tuple[float | None, str | No
     return best_val, best_name
 
 
-def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> LlamaForCausalLM:
-    model = LlamaForCausalLM.from_pretrained(model_path, dtype=dtype)
+def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> Olmo3ForCausalLM:
+    # model = LlamaForCausalLM.from_pretrained(model_path, dtype=dtype)
+    model = Olmo3ForCausalLM.from_pretrained(model_path, dtype=dtype)
     model.config.use_cache = False
     model.eval()
     model = model.to(device)
@@ -192,16 +194,16 @@ def freeze_model(model: torch.nn.Module) -> None:
 
 
 def prepare_quant_layers(
-    llama_model: LlamaModel,
+    model: Olmo3Model,
     train_layers: tuple[int, ...],
     set_scales: bool = False
 ) -> None:
-    for layer_index, layer in enumerate(llama_model.layers):
+    for layer_index, layer in enumerate(model.layers):
         if layer_index not in train_layers:
             continue
         groups = [
-            (layer.self_attn, "q_k_v"),
-            (layer.self_attn, "o"),
+            # (layer.self_attn, "q_k_v"),
+            # (layer.self_attn, "o"),
             (layer.mlp, "gate_up"),
             (layer.mlp, "down"),
         ]
@@ -251,7 +253,7 @@ def iter_layer_linears(
 
 def load_checkpoint(
     checkpoint_path: str,
-    model: LlamaForCausalLM,
+    model: Olmo3ForCausalLM,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     map_location: Optional[torch.device] = None,
@@ -433,9 +435,6 @@ def run(cfg: Config) -> None:
         if rank == 0:
             print("[run] student compile finished", flush=True)
 
-    # Cut activation memory; safe with grad accumulation
-    # student.gradient_checkpointing_enable()
-
     if distributed:
         student = DDP(student, device_ids=[rank], output_device=rank)
 
@@ -460,7 +459,7 @@ def run(cfg: Config) -> None:
         lr=cfg.lr,
         betas=(0.9, beta2),
         eps=eps,
-        weight_decay=0.1,
+        weight_decay=0.0,
         foreach=False,  # avoid multi-tensor grouping dtype issues with bf16 state casting
     )
     ensure_adamw_state_dtype(optimizer, dtype)

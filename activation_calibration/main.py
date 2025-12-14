@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help="Comma-separated decoder layer indices or 'all' (default).",
     )
-    parser.add_argument("--batch_count", type=int, default=12)
+    parser.add_argument("--batch_count", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--seq-len", type=int, default=Config.seq_len)
     parser.add_argument("--quantile", type=float, default=0.9999)

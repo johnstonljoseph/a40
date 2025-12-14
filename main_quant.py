@@ -208,7 +208,6 @@ def prepare_quant_layers(
             (layer.self_attn, "q_k_v"),
             (layer.self_attn, "o"),
             (layer.mlp, "gate_up"),
-            (layer.mlp, "down"),
         ]
         for parent_module, group_name in groups:
             act_calib_payload = torch.load(activation_calib_path(layer_index, group_name), map_location="cpu")
@@ -239,7 +238,7 @@ def iter_layer_linears(
 
     targets = (
         ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")),
-        ("mlp", ("gate_proj", "up_proj", "down_proj")),
+        ("mlp", ("gate_proj", "up_proj")),
     )
 
     for layer_index, layer in enumerate(layers):
