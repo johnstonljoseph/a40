@@ -16,7 +16,7 @@ from typing import Iterable, Iterator, Optional, Sequence
 from transformers.models.olmo3 import Olmo3ForCausalLM, Olmo3Model
 from tqdm.auto import tqdm
 
-from .quant import QuantLinear, DiagScalingLinear
+from .quant import QuantLinear
 from .data import build_dataloader
 
 DIR = Path(__file__).resolve().parent
@@ -24,11 +24,11 @@ DIR = Path(__file__).resolve().parent
 
 @dataclass
 class Config:
-    steps: int = 2000
-    batch_size: int = 6
+    steps: int = 8000
+    batch_size: int = 3
     seq_len: int = 1024
-    accumulate_steps: int = 4
-    lr: float = 1e-6
+    accumulate_steps: int = 16
+    lr: float = 5e-6
     device: str = "cuda"
     dtype: str = "bfloat16"
     base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
@@ -39,15 +39,13 @@ class Config:
     dataset_ratio_sft: float = 0.4
     dataset_ratio_dpo: float = 0.3
     dataset_ratio_rl: float = 0.3
-    shuffle_buffer_size: int = 100
+    shuffle_buffer_size: int = 1000
     seed: int = 0
     num_workers: int = 0
     checkpoint_interval: int = 2000
     starting_step: int = 0
     train_layers: Optional[tuple[int, ...]] = field(default=None)
     compile: bool = True
-    diag_lr_mult: float = 1.0
-    act_lr_mult: float = 1.0
 
 
 def parse_args() -> Config:
@@ -113,12 +111,6 @@ def parse_args() -> Config:
         action="store_false",
         help="Disable torch.compile even if default is on.",
     )
-    parser.add_argument(
-        "--diag-lr-mult",
-        type=float,
-        default=Config.diag_lr_mult,
-        help="Learning-rate multiplier for log_diag parameters in DiagScalingLinear.",
-    )
     args = parser.parse_args()
     raw_train_layers = args.train_layers.strip()
     train_layers = (
@@ -139,7 +131,6 @@ def parse_args() -> Config:
         compile=args.compile,
         dtype=args.dtype,
         accumulate_steps=args.accumulate_steps,
-        diag_lr_mult=args.diag_lr_mult,
     )
 
 
@@ -184,7 +175,7 @@ def quant_max_activation(model: torch.nn.Module) -> tuple[float | None, str | No
     best_val: float | None = None
     best_name: str | None = None
     for module in model.modules():
-        if isinstance(module, (QuantLinear, DiagScalingLinear)) and module.last_max_act is not None:
+        if isinstance(module, QuantLinear) and module.last_max_act is not None:
             val = float(module.last_max_act)
             if (best_val is None) or (val > best_val):
                 best_val = val
@@ -206,21 +197,6 @@ def freeze_model(model: torch.nn.Module) -> None:
         param.requires_grad = False
 
 
-def set_mlp_gate_up_trainable(
-    model: Olmo3Model,
-    train_layers: Sequence[int],
-    enabled: bool = True,
-    train_bias: bool = False,
-) -> None:
-    for layer_index in train_layers:
-        layer = model.layers[layer_index]
-        mlp = getattr(layer, "mlp", None)
-        for name in ("gate_proj", "up_proj"):
-            proj = getattr(mlp, name, None)
-            weight = getattr(proj, "weight", None)
-            weight.requires_grad_(enabled)
-
-
 def prepare_quant_layers(
     model: Olmo3Model,
     train_layers: tuple[int, ...],
@@ -232,38 +208,31 @@ def prepare_quant_layers(
         groups = [
             # (layer.self_attn, "q_k_v"),
             # (layer.self_attn, "o"),
-            # (layer.mlp, "gate_up"),
+            (layer.mlp, "gate_up"),
             (layer.mlp, "down"),
         ]
         for parent_module, group_name in groups:
-            # act_calib_payload = torch.load(activation_calib_path(layer_index, group_name), map_location="cpu")
-            # clip_value = act_calib_payload.get("clip_value")
+            act_calib_payload = torch.load(activation_calib_path(layer_index, group_name), map_location="cpu")
+            clip_value = act_calib_payload.get("clip_value")
 
             for name in [f"{prefix}_proj" for prefix in group_name.split("_")]:
                 linear_module = getattr(parent_module, name)
-                diag_path = diag_scaling_path(layer_index, name)
-                if not diag_path.exists():
-                    continue
-
-                diag_linear = DiagScalingLinear(
+                quant = QuantLinear(
                     linear_module.in_features,
                     linear_module.out_features,
                 )
-                setattr(parent_module, name, diag_linear)
-                diag_linear.weight = linear_module.weight
-                # diag_linear.set_trainable(True)
-                diag_linear.to(linear_module.weight.device)
-                diag_linear.q_name = f"layer{layer_index}.{parent_module.__class__.__name__}.{name}"
-
-                diag_payload = torch.load(diag_path, map_location="cpu")
-                diag_linear.set_diag_scales(diag_payload)
+                setattr(parent_module, name, quant)
+                quant.weight = linear_module.weight
+                quant.set_trainable(True)
+                quant.to(linear_module.weight.device)
+                quant.q_name = f"layer{layer_index}.{parent_module.__class__.__name__}.{name}"
                 
-                # if set_scales:
-                #     # Set activation scale
-                #     quant.set_activation_scale(clip_value)
-                #     # Set weight scales
-                #     calib_weight_payload = torch.load(weight_calib_path(layer_index, name), map_location="cpu")
-                #     quant.set_weight_scales(calib_weight_payload.get("scales"))
+                if set_scales:
+                    # Set activation scale
+                    quant.set_activation_scale(clip_value)
+                    # Set weight scales
+                    calib_weight_payload = torch.load(weight_calib_path(layer_index, name), map_location="cpu")
+                    quant.set_weight_scales(calib_weight_payload.get("scales"))
 
 
 def iter_layer_linears(
@@ -428,16 +397,15 @@ def run(cfg: Config) -> None:
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
-    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
 
     if distributed:
         if not torch.cuda.is_available():
             raise RuntimeError("Distributed training requires CUDA-capable devices.")
-        torch.cuda.set_device(local_rank)
+        torch.cuda.set_device(rank)
         backend = os.environ.get("TORCH_DISTRIBUTED_BACKEND", "nccl")
         dist.init_process_group(backend=backend, world_size=world_size, rank=rank)
 
-    device = torch.device(f"cuda:{local_rank}" if distributed else cfg.device)
+    device = torch.device(f"cuda:{rank}" if distributed else cfg.device)
     dtype = getattr(torch, cfg.dtype)
     use_bf16 = dtype == torch.bfloat16
 
@@ -461,7 +429,6 @@ def run(cfg: Config) -> None:
         target_layers,
         cfg.starting_step == 0
     )
-    # set_mlp_gate_up_trainable(student.model, target_layers, enabled=True)
 
     if cfg.compile:
         if rank == 0:
@@ -475,42 +442,35 @@ def run(cfg: Config) -> None:
             print("[run] student compile finished", flush=True)
 
     if distributed:
-        student = DDP(student, device_ids=[local_rank], output_device=local_rank)
+        student = DDP(student, device_ids=[rank], output_device=rank)
 
     # Separate LR for activation scales (log_act_s): 50x base LR
     act_params: list[torch.nn.Parameter] = []
-    diag_params: list[torch.nn.Parameter] = []
     other_params: list[torch.nn.Parameter] = []
     for name, param in student.named_parameters():
         if not param.requires_grad:
             continue
         if name.endswith("log_act_s"):
             act_params.append(param)
-        elif name.endswith("log_diag"):
-            diag_params.append(param)
         else:
             other_params.append(param)
 
     beta2 = 0.95 if use_bf16 else 0.999
     eps = 1e-10 if use_bf16 else 1e-8
-    optimizer_groups = [
-        {"params": other_params, "lr": cfg.lr},
-        {"params": act_params, "lr": cfg.lr * cfg.act_lr_mult},
-    ]
-    optimizer_groups.append(
-        {"params": diag_params, "lr": cfg.lr * cfg.diag_lr_mult}
-    )
     optimizer = torch.optim.AdamW(
-        optimizer_groups,
+        [
+            {"params": other_params, "lr": cfg.lr},
+            {"params": act_params, "lr": cfg.lr * 50.0},
+        ],
         lr=cfg.lr,
         betas=(0.9, beta2),
         eps=eps,
-        weight_decay=0.01,
+        weight_decay=0.0,
         foreach=False,  # avoid multi-tensor grouping dtype issues with bf16 state casting
     )
     ensure_adamw_state_dtype(optimizer, dtype)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.steps, eta_min=cfg.lr * 0.05
+        optimizer, T_max=cfg.steps, eta_min=cfg.lr * 0.1
     )
 
     start_step = cfg.starting_step
@@ -529,30 +489,20 @@ def run(cfg: Config) -> None:
     if rank == 0:
         print(f"[run] resumed from step {start_step}")
 
-    batch_iter = iter(
-        build_dataloader(
-            cfg,
-            base_path,
-            seed=cfg.seed + start_step,
-            world_size=world_size,
-            rank=rank,
-        )
-    )
+    batch_iter = iter(build_dataloader(
+        cfg,
+        base_path,
+        world_size,
+        rank,
+    ))
 
     ema_miss: float | None = None
-    ema_kl: float | None = None
     log_path = DIR / "logs" / "top1_miss.csv"
-    log_has_ema_kl = False
     if rank == 0:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        if log_path.exists():
-            with open(log_path, "r") as f:
-                header = f.readline()
-            log_has_ema_kl = "ema_kl" in header
-        else:
-            log_has_ema_kl = True
+        if not log_path.exists():
             with open(log_path, "w") as f:
-                f.write("step,kl,ema_kl,top1_miss,ema_miss,top1_acc,flip_penalty,median_rel_margin,flip_severity,max_act,max_act_name\n")
+                f.write("step,kl,top1_miss,ema_miss,top1_acc,flip_penalty,median_rel_margin,flip_severity,max_act,max_act_name\n")
 
     progress = tqdm(
         range(start_step, cfg.steps),
@@ -637,30 +587,19 @@ def run(cfg: Config) -> None:
         max_act_val = last_max_act if last_max_act is not None else 0.0
         max_act_name = last_max_act_name if last_max_act_name is not None else "n/a"
 
-        ema_kl = kl_val if ema_kl is None else 0.9 * ema_kl + 0.1 * kl_val
-
         if rank == 0 and ((step + 1) % log_interval == 0 or step == start_step):
             ema_miss = top1_miss_val if ema_miss is None else 0.9 * ema_miss + 0.1 * top1_miss_val
             with open(log_path, "a") as f:
-                if log_has_ema_kl:
-                    f.write(
-                        f"{step},{kl_val:.6f},{ema_kl:.6f},{top1_miss_val:.6f},{ema_miss:.6f},"
-                        f"{top1_acc_val:.6f},{flip_pen_val:.6f},"
-                        f"{median_rel_val:.6f},{flip_sev_val:.6f},"
-                        f"{max_act_val:.6f},{max_act_name}\n"
-                    )
-                else:
-                    f.write(
-                        f"{step},{kl_val:.6f},{top1_miss_val:.6f},{ema_miss:.6f},"
-                        f"{top1_acc_val:.6f},{flip_pen_val:.6f},"
-                        f"{median_rel_val:.6f},{flip_sev_val:.6f},"
-                        f"{max_act_val:.6f},{max_act_name}\n"
-                    )
+                f.write(
+                    f"{step},{kl_val:.6f},{top1_miss_val:.6f},{ema_miss:.6f},"
+                    f"{top1_acc_val:.6f},{flip_pen_val:.6f},"
+                    f"{median_rel_val:.6f},{flip_sev_val:.6f},"
+                    f"{max_act_val:.6f},{max_act_name}\n"
+                )
 
         progress.set_postfix_str(
             (
                 f"kl={kl_val:.4f} "
-                f"ema_kl={ema_kl if ema_kl is not None else kl_val:.4f} "
                 f"max_act={max_act_val:.4f}({max_act_name}) "
                 f"top1_miss={top1_miss_val:.3f} ema_miss={ema_miss if ema_miss is not None else top1_miss_val:.3f} "
                 f"flip_pen={flip_pen_val:.3f} "

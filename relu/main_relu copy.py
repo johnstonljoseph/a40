@@ -48,8 +48,9 @@ class Config:
     steps: int = 2000
     batch_size: int = 5
     seq_len: int = 1024
-    accumulate_steps: int = 3
-    lr: float = 1e-5
+    accumulate_steps: int = 8
+    lr: float = 4e-5
+    act_param_lr_mult: float = 1.0
     device: str = "cuda"
     dtype: str = "bfloat16"
     base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
@@ -60,10 +61,10 @@ class Config:
     dataset_ratio_sft: float = 0.3
     dataset_ratio_dpo: float = 0.3
     dataset_ratio_rl: float = 0.4
-    shuffle_buffer_size: int = 10000
+    shuffle_buffer_size: int = 100
     seed: int = 42
     num_workers: int = 0
-    blend_steps: Optional[int] = 50
+    blend_steps: Optional[int] = 20
     compile: bool = True
 
 
@@ -72,6 +73,12 @@ def parse_args() -> Config:
     parser.add_argument("--steps", type=int, default=Config.steps)
     parser.add_argument("--batch-size", dest="batch_size", type=int, default=Config.batch_size)
     parser.add_argument("--output-dir", type=str, default=Config.output_dir)
+    parser.add_argument(
+        "--act-param-lr-mult",
+        type=float,
+        default=Config.act_param_lr_mult,
+        help="LR multiplier for BlendableActivation parameters (a_p/a_m/x0).",
+    )
     parser.add_argument("--dataset-sft", type=str, default=Config.dataset_sft)
     parser.add_argument("--dataset-dpo", type=str, default=Config.dataset_dpo)
     parser.add_argument("--dataset-rl", type=str, default=Config.dataset_rl)
@@ -117,15 +124,11 @@ def parse_args() -> Config:
     )
     args = parser.parse_args()
 
-    def _opt_steps(value: Optional[int]) -> Optional[int]:
-        if value is None:
-            return None
-        return value if value > 0 else None
-
     return Config(
         steps=args.steps,
         batch_size=args.batch_size,
         output_dir=args.output_dir,
+        act_param_lr_mult=args.act_param_lr_mult,
         dataset_sft=args.dataset_sft,
         dataset_dpo=args.dataset_dpo,
         dataset_rl=args.dataset_rl,
@@ -138,7 +141,7 @@ def parse_args() -> Config:
         num_workers=args.num_workers,
         dtype=args.dtype,
         accumulate_steps=args.accumulate_steps,
-        blend_steps=_opt_steps(args.blend_steps),
+        blend_steps=args.blend_steps,
         compile=args.compile,
     )
 
@@ -172,56 +175,88 @@ class _BlendActivationFunction(Function):
     @staticmethod
     def forward(
         ctx,
-        gate: torch.Tensor,
+        k: float,
+        delta: float,
         blend: torch.Tensor,
+        gate: torch.Tensor,
         a_p: torch.Tensor,
         a_m: torch.Tensor,
         x0: torch.Tensor,
-        k: float,
+        y0: torch.Tensor,
     ) -> torch.Tensor:
-        ctx.save_for_backward(gate, blend, a_p, a_m, x0)
+        ctx.save_for_backward(blend, gate, a_p, a_m, x0, y0)
         ctx.k = float(k)
+        ctx.delta = float(delta)
         silu = F.silu(gate)
 
-        y0 = F.silu(x0)
         piecewise = torch.where(
             gate >= x0,
-            a_p * (gate - x0) + y0,
-            a_m * (gate - x0) + y0,
+            a_p * (gate - x0) - y0,
+            a_m * (gate - x0) - y0,
         )
         return silu * (1.0 - blend) + piecewise * blend
 
     @staticmethod
     def backward(
         ctx, grad_output: torch.Tensor
-    ) -> tuple[torch.Tensor, None, None, None, None, None]:
-        (gate, blend, a_p, a_m, x0) = ctx.saved_tensors
-        k = float(ctx.k)
+    ) -> tuple[None, None, None, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        (blend, gate, a_p, a_m, x0, y0) = ctx.saved_tensors
+        delta = float(ctx.delta)
         blend = blend.to(dtype=gate.dtype)
 
         sig = torch.sigmoid(gate)
         dsilu = sig + gate * sig * (1.0 - sig)
 
-        m = torch.sigmoid(k * (gate - x0))
-        dm = k * m * (1.0 - m)
-        dpiecewise = m * a_p + (1.0 - m) * a_m + dm * (a_p - a_m) * (gate - x0)
+        # Surrogate derivative: within [x0-delta, x0+delta] linearly interpolate slope.
+        t = gate - x0
+        d = torch.as_tensor(delta, dtype=gate.dtype, device=gate.device)
 
-        true_grad = dsilu * (1.0 - blend) + dpiecewise * blend
-        grad_gate = grad_output * true_grad
+        left = (t <= -d).to(dtype=gate.dtype)
+        right = (t >= d).to(dtype=gate.dtype)
+        mid = 1.0 - left - right
 
-        return grad_gate, None, None, None, None, None
+        slope_mid = ((a_p - a_m) / (2.0 * d)) * t + (a_p + a_m) / 2.0
+        slope = left * a_m + right * a_p + mid * slope_mid
+
+        dact_dgate = dsilu * (1.0 - blend) + slope * blend
+        grad_gate = grad_output * dact_dgate
+
+        grad_piece = grad_output * blend
+
+        # Parameter grads via a quadratic surrogate in the transition region (consistent with linear slope).
+        d_a_p_mid = (t * t) * (1.0 / (4.0 * d)) + t * 0.5 + d * 0.25
+        d_a_m_mid = (t * t) * (-1.0 / (4.0 * d)) + t * 0.5 - d * 0.25
+
+        grad_a_p = (grad_piece * (right * t + mid * d_a_p_mid)).sum()
+        grad_a_m = (grad_piece * (left * t + mid * d_a_m_mid)).sum()
+
+        # For y = surrogate(t) - y0, d/dx0 = -d/dt (ignoring region boundary).
+        grad_x0 = (grad_piece * (-slope)).sum()
+        grad_y0 = (grad_piece * (-1.0)).sum()
+
+        return None, None, None, grad_gate, grad_a_p, grad_a_m, grad_x0, grad_y0
 
 
 class BlendableActivation(nn.Module):
     """Blend between SiLU (0.0) and ReLU (1.0)."""
 
-    def __init__(self, a_p: float, a_m: float, x0: float, k: float = 20.0) -> None:
+    def __init__(
+        self,
+        k: float = 20.0,
+        delta: float = 0.1,
+        a_p: float = 1.0,
+        a_m: float = -0.04,
+        x0: float = -0.2,
+        y0: float = 0.2,
+    ) -> None:
         super().__init__()
         self.register_buffer("_blend", torch.tensor(0.0))
-        self.register_buffer("_a_p", torch.tensor(float(a_p)))
-        self.register_buffer("_a_m", torch.tensor(float(a_m)))
-        self.register_buffer("_x0", torch.tensor(float(x0)))
+        self._a_p = nn.Parameter(torch.tensor(float(a_p)))
+        self._a_m = nn.Parameter(torch.tensor(float(a_m)))
+        self._x0 = nn.Parameter(torch.tensor(float(x0)))
+        self._y0 = nn.Parameter(torch.tensor(float(y0)))
         self._k = float(k)
+        self._delta = float(delta)
 
     def set_blend(self, value: float) -> None:
         self._blend.data.fill_(float(value))
@@ -232,7 +267,8 @@ class BlendableActivation(nn.Module):
         a_p = self._a_p.to(dtype=gate.dtype)
         a_m = self._a_m.to(dtype=gate.dtype)
         x0 = self._x0.to(dtype=gate.dtype)
-        return _BlendActivationFunction.apply(gate, blend, a_p, a_m, x0, self._k)
+        y0 = self._y0.to(dtype=gate.dtype)
+        return _BlendActivationFunction.apply(self._k, self._delta, blend, gate, a_p, a_m, x0, y0)
 
 
 def patch_single_layer_activation(
@@ -252,10 +288,9 @@ def patch_single_layer_activation(
         raise ValueError(f"Missing calibration values for layer {layer_index}")
     (a_p, a_m, x0) = calibration[layer_index]
 
-    act_fn = BlendableActivation(a_p=a_p, a_m=a_m, x0=x0, k=k).to(
+    act_fn = BlendableActivation(k=k).to(
         device=mlp.gate_proj.weight.device, dtype=mlp.gate_proj.weight.dtype
     )
-    act_fn.requires_grad_(False)
     mlp.act_fn = act_fn
     return act_fn
 
@@ -338,7 +373,7 @@ def compute_kl_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
     attention_mask: torch.Tensor,
-    T: float = 2.0,
+    T: float = 1.0,
 ) -> torch.Tensor:
     s = (student_logits / T).log_softmax(dim=-1)
     t = (teacher_logits / T).log_softmax(dim=-1).exp()
@@ -429,6 +464,12 @@ def run(cfg: Config) -> None:
     act_fns = patch_layer_activations(student.model, calibration=calibration)
     trainable_params = target_mlp_parameters_multi(student.model, trainable=True)
 
+    act_shape_params: list[nn.Parameter] = []
+    for act_fn in act_fns:
+        act_shape_params.extend([act_fn._a_p, act_fn._a_m, act_fn._x0, act_fn._y0])
+    act_shape_param_ids = {id(p) for p in act_shape_params}
+    mlp_params = [p for p in trainable_params if id(p) not in act_shape_param_ids]
+
     if cfg.compile:
         print("[run] compiling student with torch.compile...", flush=True)
         student = torch.compile(
@@ -438,11 +479,16 @@ def run(cfg: Config) -> None:
         )
 
     optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=cfg.lr,
+        [
+            {"params": mlp_params, "lr": cfg.lr, "weight_decay": 0.0},
+            {
+                "params": act_shape_params,
+                "lr": cfg.lr * cfg.act_param_lr_mult,
+                "weight_decay": 0.0,
+            },
+        ],
         betas=(0.9, 0.95),
         eps=1e-8,
-        weight_decay=0.0,
         foreach=False,
     )
     ensure_adamw_state_dtype(optimizer, dtype)
@@ -452,8 +498,6 @@ def run(cfg: Config) -> None:
 
     dataloader = build_dataloader(cfg, base_path)
     batch_iter = iter(dataloader)
-
-    blend_horizon = cfg.blend_steps if cfg.blend_steps is not None else cfg.steps
 
     progress = tqdm(
         range(cfg.steps),
@@ -465,7 +509,7 @@ def run(cfg: Config) -> None:
     last_metrics: Optional[dict[str, torch.Tensor]] = None
 
     for step in progress:
-        blend = activation_mix_at_step(step, blend_horizon)
+        blend = activation_mix_at_step(step, cfg.blend_steps)
         for act_fn in act_fns:
             act_fn.set_blend(blend)
 

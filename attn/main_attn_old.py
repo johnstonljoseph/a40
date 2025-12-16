@@ -1,4 +1,3 @@
-import argparse
 import copy
 import math
 import os
@@ -6,15 +5,13 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.nn as nn
-import time
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.nn.utils import clip_grad_norm_
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Optional, Sequence
-from transformers.models.olmo3 import Olmo3ForCausalLM, Olmo3Model, modeling_olmo3
+from typing import Optional
+from transformers.models.olmo3 import Olmo3ForCausalLM, modeling_olmo3
 from transformers.models.olmo3.modeling_olmo3 import repeat_kv, ALL_ATTENTION_FUNCTIONS
 from tqdm.auto import tqdm
 
@@ -27,164 +24,30 @@ DIR = Path(__file__).resolve().parent
 @dataclass
 class Config:
     steps: int = 2000
-    batch_size: int = 4
+    batch_size: int = 5
     seq_len: int = 1024
     accumulate_steps: int = 8
-    lr: float = 1e-5
+    lr: float = 4e-5
     device: str = "cuda"
     dtype: str = "bfloat16"
     base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
-    # dataset_a: str = "allenai/Dolci-Think-SFT-7B"
-    # dataset_b: str = "allenai/Dolci-Think-DPO-7B"
-    # dataset_c: str = "allenai/Dolci-Think-RL-7B"
-    dataset_a: str = "allenai/tulu-3-sft-mixture"
-    dataset_b: str = "mlfoundations/dclm-baseline-1.0"
-    dataset_c: Optional[str] = None
-    dataset_ratio_a: float = 0.2
-    dataset_ratio_b: float = 1.0
-    dataset_ratio_c: float = 0.0
-    dataset_split: str = "train"
-    shuffle_buffer_size: int = 10_000
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.4
+    dataset_ratio_dpo: float = 0.3
+    dataset_ratio_rl: float = 0.3
+    shuffle_buffer_size: int = 100
     seed: int = 42
     num_workers: int = 0
-    checkpoint_interval: int = 16000
+    checkpoint_interval: int = 2000
     starting_step: int = 0
     train_layers: Optional[tuple[int, ...]] = field(default=None)
-    compile: bool = False
-    lambda_steps: int = 100
-    kl_triggered_blend: bool = False
-    blend_kl_threshold: float = 0.05
-
-
-def parse_args() -> Config:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--steps", type=int, default=Config.steps)
-    parser.add_argument("--batch-size", dest="batch_size", type=int, default=Config.batch_size)
-    parser.add_argument("--dataset-a", type=str, default=Config.dataset_a)
-    parser.add_argument("--dataset-b", type=str, default=Config.dataset_b)
-    parser.add_argument("--dataset-c", type=str, default=Config.dataset_c)
-    parser.add_argument("--dataset-ratio-a", type=float, default=Config.dataset_ratio_a)
-    parser.add_argument("--dataset-ratio-b", type=float, default=Config.dataset_ratio_b)
-    parser.add_argument("--dataset-ratio-c", type=float, default=Config.dataset_ratio_c)
-    parser.add_argument(
-        "--seq-len",
-        dest="seq_len",
-        type=int,
-        default=Config.seq_len,
-        help="Sequence length for packed training batches",
-    )
-    parser.add_argument("--shuffle-buffer-size", type=int, default=Config.shuffle_buffer_size)
-    parser.add_argument("--seed", type=int, default=Config.seed)
-    parser.add_argument("--num-workers", type=int, default=Config.num_workers)
-    parser.add_argument(
-        "--train-layers",
-        type=str,
-        default="all",
-        help="Comma-separated decoder layer indices to finetune or 'all' (default)",
-    )
-    parser.add_argument(
-        "--checkpoint-interval",
-        type=int,
-        default=Config.checkpoint_interval,
-        help="Save a checkpoint every N steps (0 to disable)",
-    )
-    parser.add_argument(
-        "--starting-step",
-        type=int,
-        default=Config.starting_step,
-        help="Step number to begin training from (0 to start fresh).",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=Config.device,
-        help="Device to run distillation on (e.g., cuda:x or cpu).",
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default=Config.dtype,
-        help="Torch dtype for loading models (e.g., float32, bfloat16).",
-    )
-    parser.add_argument(
-        "--accumulate-steps",
-        type=int,
-        default=Config.accumulate_steps,
-        help="Number of micro-batches to accumulate before an optimizer step.",
-    )
-    parser.add_argument(
-        "--compile",
-        dest="compile",
-        action="store_true",
-        default=Config.compile,
-        help="Use torch.compile on the student model for speed (may increase startup time).",
-    )
-    parser.add_argument(
-        "--no-compile",
-        dest="compile",
-        action="store_false",
-        help="Disable torch.compile even if default is on.",
-    )
-    parser.add_argument(
-        "--lambda-steps",
-        type=int,
-        default=Config.lambda_steps,
-        help="Number of steps over which to anneal activation mix (start fixed at 0).",
-    )
-    parser.add_argument(
-        "--kl-triggered-blend",
-        action="store_true",
-        default=Config.kl_triggered_blend,
-        help="Advance activation blend based on KL threshold crossings instead of cosine schedule.",
-    )
-    parser.add_argument(
-        "--blend-kl-threshold",
-        type=float,
-        default=Config.blend_kl_threshold,
-        help="KL threshold used to trigger blend increments when kl-triggered-blend is enabled.",
-    )
-    args = parser.parse_args()
-    raw_train_layers = args.train_layers.strip()
-    train_layers = (
-        None
-        if raw_train_layers.lower() == "all"
-        else tuple(int(tok) for tok in raw_train_layers.split(",") if tok.strip())
-    )
-    return Config(
-        steps=args.steps,
-        batch_size=args.batch_size,
-        dataset_a=args.dataset_a,
-        dataset_b=args.dataset_b,
-        dataset_c=args.dataset_c,
-        dataset_ratio_a=args.dataset_ratio_a,
-        dataset_ratio_b=args.dataset_ratio_b,
-        dataset_ratio_c=args.dataset_ratio_c,
-        seq_len=args.seq_len,
-        shuffle_buffer_size=args.shuffle_buffer_size,
-        seed=args.seed,
-        num_workers=args.num_workers,
-        checkpoint_interval=args.checkpoint_interval,
-        starting_step=args.starting_step,
-        train_layers=train_layers,
-        compile=args.compile,
-        dtype=args.dtype,
-        accumulate_steps=args.accumulate_steps,
-        lambda_steps=args.lambda_steps,
-        kl_triggered_blend=args.kl_triggered_blend,
-        blend_kl_threshold=args.blend_kl_threshold,
-    )
-
+    compile: bool = True
+    lambda_steps: int = 50
 
 def checkpoint_path(step: int) -> Path:
     return DIR / "checkpoints" / f"step_{step}.pt"
-
-def activation_calib_path(layer_index: int, group_name: str):
-    act_scales_dir = DIR / "activation_calibration" / "values"
-    return act_scales_dir / f"{layer_index}" / f"{group_name}.pt"
-
-def weight_calib_path(layer_index: int, name: str):
-    weight_scales_dir = DIR / "weight_calibration" / "values"
-    return weight_scales_dir / f"{layer_index}" / f"{name}.pt"
 
 
 def resolve_model_path(path_str: str) -> str:
@@ -235,23 +98,9 @@ def softmix_attention_forward(
     dropout: float = 0.0,
     **kwargs,
 ):
-    # Lazy-init per-head learnable scale s in (0,1) and bias t>0, starting at s=0.5, t=1.0
-    if not hasattr(module, "raw_softmix_scale"):
-        num_heads = module.config.num_attention_heads
-        module.register_parameter(
-            "raw_softmix_scale",
-            nn.Parameter(torch.zeros(num_heads, 1, 1, device=query.device, dtype=query.dtype)),
-        )
-    if not hasattr(module, "raw_softmix_bias"):
-        # softplus^{-1}(1.0) = log(exp(1)-1)
-        init_bias = math.log(math.e - 1.0)
-        num_heads = module.config.num_attention_heads
-        module.register_parameter(
-            "raw_softmix_bias",
-            nn.Parameter(torch.full((num_heads, 1, 1), init_bias, device=query.device, dtype=query.dtype)),
-        )
-    s = torch.sigmoid(module.raw_softmix_scale).view(1, -1, 1, 1)
-    t = F.softplus(module.raw_softmix_bias).view(1, -1, 1, 1)
+    s = F.softplus(module.raw_softmix_s).view(1, -1, 1, 1).to(torch.float32)
+    # t = 1.0
+    t = module.raw_softmix_t.view(1, -1, 1, 1).to(torch.float32)
 
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
@@ -261,25 +110,30 @@ def softmix_attention_forward(
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_logits = attn_logits + causal_mask
 
-    logits = attn_logits
-    soft = nn.functional.softmax(logits, dim=-1, dtype=torch.float32)
+    x = attn_logits.to(torch.float32)
+    finite = torch.isfinite(x)
+    denom = finite.sum(dim=-1, keepdim=True).clamp(min=1)
+    x_mean = torch.where(finite, x, torch.zeros_like(x)).sum(dim=-1, keepdim=True) / denom
+    x = x - x_mean
+    all_masked = ~torch.isfinite(x.max(dim=-1, keepdim=True).values)
 
-    poly = torch.clamp(s * logits + t, min=0.0)
+    soft = F.softmax(x, dim=-1)
+    soft = soft.masked_fill(all_masked.expand_as(soft), 0.0)
+
+    # poly = max(0, s*x + t)
+    poly = torch.clamp(s * x + t, min=0.0)
+    poly = poly.masked_fill(all_masked.expand_as(poly), 0.0)
     poly_sum = poly.sum(dim=-1, keepdim=True)
-    poly = torch.where(poly_sum > 0, poly / poly_sum, soft)
+    poly = poly / (poly_sum + 1e-6)
 
     attn_weights = ((1.0 - _ATTN_BLEND) * soft + _ATTN_BLEND * poly).to(query.dtype)
+    attn_weights = attn_weights.masked_fill(all_masked.expand_as(attn_weights), 0.0)
 
     # attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
-
-
-def prepare_attention_activation_mix(model: Olmo3Model) -> None:
-    """Placeholder to mirror call sites; no-op since attention uses fixed softmax."""
-    return None
 
 
 def quant_max_activation(model: torch.nn.Module) -> tuple[float | None, str | None]:
@@ -307,64 +161,6 @@ def freeze_model(model: torch.nn.Module) -> None:
         param.requires_grad = False
 
 
-def prepare_quant_layers(
-    model: Olmo3Model,
-    train_layers: tuple[int, ...],
-    set_scales: bool = False
-) -> None:
-    for layer_index, layer in enumerate(model.layers):
-        if layer_index not in train_layers:
-            continue
-        groups = [
-            (layer.self_attn, "q_k_v"),
-            (layer.self_attn, "o"),
-            (layer.mlp, "gate_up"),
-            (layer.mlp, "down")
-        ]
-        for parent_module, group_name in groups:
-            act_calib_payload = torch.load(activation_calib_path(layer_index, group_name), map_location="cpu")
-            clip_value = act_calib_payload.get("clip_value")
-
-            for name in [f"{prefix}_proj" for prefix in group_name.split("_")]:
-                linear_module = getattr(parent_module, name)
-                quant = QuantLinear(
-                    linear_module.in_features,
-                    linear_module.out_features,
-                )
-                setattr(parent_module, name, quant)
-                quant.weight = linear_module.weight
-                quant.set_trainable(True)
-                quant.to(linear_module.weight.device)
-                quant.q_name = f"layer{layer_index}.{parent_module.__class__.__name__}.{name}"
-                
-                if set_scales:
-                    # quant.set_activation_scale(clip_value)
-                    calib_weight_payload = torch.load(weight_calib_path(layer_index, name), map_location="cpu")
-                    quant.set_weight_scales(calib_weight_payload.get("scales"))
-
-
-def iter_layer_linears(
-    layers: Iterable[torch.nn.Module],
-) -> Iterator[tuple[int, torch.nn.Module, str, torch.nn.Module]]:
-    """Yield each target linear module in decoder layers."""
-
-    targets = (
-        ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")),
-        ("mlp", ("gate_proj", "up_proj", "down_proj")),
-    )
-
-    for layer_index, layer in enumerate(layers):
-        for parent_name, child_names in targets:
-            parent = getattr(layer, parent_name, None)
-            if parent is None:
-                continue
-            for name in child_names:
-                child = getattr(parent, name, None)
-                if child is None:
-                    continue
-                yield layer_index, parent, name, child
-
-
 def load_checkpoint(
     checkpoint_path: str,
     model: Olmo3ForCausalLM,
@@ -374,11 +170,22 @@ def load_checkpoint(
 ) -> None:
     """Load checkpoint into model (must already have QuantLinear modules)."""
     ckpt = torch.load(checkpoint_path, weights_only=False, map_location=map_location)
-    model.load_state_dict(ckpt["model"])
+    incompatible = model.load_state_dict(ckpt["model"], strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        print(
+            f"[load_checkpoint] missing_keys={len(incompatible.missing_keys)} unexpected_keys={len(incompatible.unexpected_keys)}",
+            flush=True,
+        )
     if optimizer is not None:
-        optimizer.load_state_dict(ckpt["optimizer"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except (KeyError, ValueError) as e:
+            print(f"[load_checkpoint] optimizer state not loaded: {e}", flush=True)
     if scheduler is not None:
-        scheduler.load_state_dict(ckpt["scheduler"])
+        try:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        except (KeyError, ValueError) as e:
+            print(f"[load_checkpoint] scheduler state not loaded: {e}", flush=True)
 
 
 def ensure_adamw_state_dtype(optimizer: torch.optim.AdamW, target_dtype: torch.dtype) -> None:
@@ -419,24 +226,6 @@ def compute_kl_loss(
     token_kl = kl.sum(dim=-1)
     mask = attention_mask.float()
     return (token_kl * mask).sum() / mask.sum()
-
-
-def compute_token_cross_entropy(
-    logits: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor
-) -> torch.Tensor:
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = labels[:, 1:].contiguous()
-    shift_mask = attention_mask[:, 1:].contiguous().view(-1).float()
-    vocab_size = shift_logits.size(-1)
-    loss = F.cross_entropy(
-        shift_logits.view(-1, vocab_size),
-        shift_labels.view(-1),
-        reduction="none",
-    )
-    mask_sum = shift_mask.sum()
-    if mask_sum == 0:
-        return torch.tensor(0.0, device=logits.device)
-    return (loss * shift_mask).sum() / mask_sum
 
 
 
@@ -501,7 +290,8 @@ def argmax_stability_metrics(
     }
 
 
-def run(cfg: Config) -> None:
+def main() -> None:
+    cfg = Config()
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
@@ -526,6 +316,7 @@ def run(cfg: Config) -> None:
     if rank == 0:
         print("[run] loading teacher model...", flush=True)
     teacher = load_model(base_path, device, dtype)
+    freeze_model(teacher)
     teacher.model.config._attn_implementation = "teacher"
 
     if rank == 0:
@@ -534,11 +325,25 @@ def run(cfg: Config) -> None:
     student.model.config._attn_implementation = "student"
     if rank == 0:
         print(f"[run] attention impl: teacher={teacher.model.config._attn_implementation}, student={student.model.config._attn_implementation}", flush=True)
-    freeze_model(teacher)
     target_layers = cfg.train_layers
     if target_layers is None:
         target_layers = tuple(range(len(student.model.layers)))
-    # attention already aligned; no additional patching needed
+
+    init_raw_s = math.log(math.expm1(0.2))
+    init_raw_t = 1.0
+    for layer_index, layer in enumerate(student.model.layers):
+        attn = layer.self_attn
+        num_heads = attn.config.num_attention_heads
+        attn.raw_softmix_s = nn.Parameter(
+            torch.full((num_heads, 1, 1), init_raw_s, device=device, dtype=dtype)
+        )
+        attn.raw_softmix_t = nn.Parameter(
+            torch.full((num_heads, 1, 1), init_raw_t, device=device, dtype=dtype)
+        )
+
+        train_this_layer = layer_index in target_layers
+        for p in attn.parameters():
+            p.requires_grad = train_this_layer
 
     if cfg.compile:
         if rank == 0:
@@ -551,23 +356,14 @@ def run(cfg: Config) -> None:
         if rank == 0:
             print("[run] student compile finished", flush=True)
 
-    # Cut activation memory; safe with grad accumulation
-    # student.gradient_checkpointing_enable()
-
-    if distributed:
-        student = DDP(student, device_ids=[rank], output_device=rank)
-
-    # Separate LR for activation scales (log_act_s): 50x base LR
-    act_params: list[torch.nn.Parameter] = []
-    leaky_params: list[torch.nn.Parameter] = []
+    # Separate LR for softmix (s,t) parameters: 50x base LR
+    st_params: list[torch.nn.Parameter] = []
     other_params: list[torch.nn.Parameter] = []
     for name, param in student.named_parameters():
         if not param.requires_grad:
             continue
-        if name.endswith("log_act_s"):
-            act_params.append(param)
-        elif ".act_fn." in name:
-            leaky_params.append(param)
+        if name.endswith("raw_softmix_s") or name.endswith("raw_softmix_t"):
+            st_params.append(param)
         else:
             other_params.append(param)
 
@@ -576,10 +372,8 @@ def run(cfg: Config) -> None:
     param_groups: list[dict[str, object]] = []
     if other_params:
         param_groups.append({"params": other_params, "lr": cfg.lr})
-    if act_params:
-        param_groups.append({"params": act_params, "lr": cfg.lr * 50.0})
-    if leaky_params:
-        param_groups.append({"params": leaky_params, "lr": cfg.lr})
+    if st_params:
+        param_groups.append({"params": st_params, "lr": cfg.lr * 1.0})
     optimizer = torch.optim.AdamW(
         param_groups,
         lr=cfg.lr,
@@ -617,14 +411,19 @@ def run(cfg: Config) -> None:
     ))
 
     ema_miss: float | None = None
-    triggered_blend = 0.0
-    blend_increment = 1.0 / max(1, cfg.lambda_steps)
+    ema_kl: float | None = None
     log_path = DIR / "logs" / "top1_miss.csv"
+    log_has_ema_kl = False
     if rank == 0:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        if not log_path.exists():
+        if log_path.exists():
+            with open(log_path, "r") as f:
+                header = f.readline()
+            log_has_ema_kl = "ema_kl" in header
+        else:
+            log_has_ema_kl = True
             with open(log_path, "w") as f:
-                f.write("step,kl,top1_miss,ema_miss,top1_acc,flip_penalty,median_rel_margin,flip_severity,max_act,max_act_name\n")
+                f.write("step,kl,ema_kl,top1_miss,ema_miss,top1_acc,flip_penalty,median_rel_margin,flip_severity,max_act,max_act_name\n")
 
     progress = tqdm(
         range(start_step, cfg.steps),
@@ -650,10 +449,7 @@ def run(cfg: Config) -> None:
 
     for step in progress:
         optimizer.zero_grad(set_to_none=True)
-        if cfg.kl_triggered_blend:
-            current_blend = triggered_blend
-        else:
-            current_blend = activation_mix_at_step(step, cfg.lambda_steps)
+        current_blend = activation_mix_at_step(step, cfg.lambda_steps)
         set_attention_activation_mix(current_blend)
 
         # Gradient accumulation over micro-batches
@@ -714,26 +510,31 @@ def run(cfg: Config) -> None:
         max_act_val = last_max_act if last_max_act is not None else 0.0
         max_act_name = last_max_act_name if last_max_act_name is not None else "n/a"
 
-        if cfg.kl_triggered_blend and triggered_blend < 1.0:
-            if kl_val <= cfg.blend_kl_threshold:
-                triggered_blend = min(1.0, triggered_blend + blend_increment)
-                set_attention_activation_mix(triggered_blend)
+        ema_kl = kl_val if ema_kl is None else 0.9 * ema_kl + 0.1 * kl_val
 
         if rank == 0 and ((step + 1) % log_interval == 0 or step == start_step):
             ema_miss = top1_miss_val if ema_miss is None else 0.9 * ema_miss + 0.1 * top1_miss_val
             with open(log_path, "a") as f:
-                f.write(
-                    f"{step},{kl_val:.6f},{top1_miss_val:.6f},{ema_miss:.6f},"
-                    f"{top1_acc_val:.6f},{flip_pen_val:.6f},"
-                    f"{median_rel_val:.6f},{flip_sev_val:.6f},"
-                    f"{max_act_val:.6f},{max_act_name}\n"
-                )
+                if log_has_ema_kl:
+                    f.write(
+                        f"{step},{kl_val:.6f},{ema_kl:.6f},{top1_miss_val:.6f},{ema_miss:.6f},"
+                        f"{top1_acc_val:.6f},{flip_pen_val:.6f},"
+                        f"{median_rel_val:.6f},{flip_sev_val:.6f},"
+                        f"{max_act_val:.6f},{max_act_name}\n"
+                    )
+                else:
+                    f.write(
+                        f"{step},{kl_val:.6f},{top1_miss_val:.6f},{ema_miss:.6f},"
+                        f"{top1_acc_val:.6f},{flip_pen_val:.6f},"
+                        f"{median_rel_val:.6f},{flip_sev_val:.6f},"
+                        f"{max_act_val:.6f},{max_act_name}\n"
+                    )
 
-        display_blend = triggered_blend if cfg.kl_triggered_blend else current_blend
         progress.set_postfix_str(
             (
-                f"blend={display_blend:.3f} "
+                f"blend={current_blend:.3f} "
                 f"kl={kl_val:.4f} "
+                f"ema_kl={ema_kl:.4f} "
                 f"max_act={max_act_val:.4f}({max_act_name}) "
                 f"top1_miss={top1_miss_val:.3f} ema_miss={ema_miss if ema_miss is not None else top1_miss_val:.3f} "
                 f"flip_pen={flip_pen_val:.3f} "
@@ -758,11 +559,6 @@ def run(cfg: Config) -> None:
 
     if distributed:
         dist.destroy_process_group()
-
-
-def main() -> None:
-    cfg = parse_args()
-    run(cfg)
 
 
 if __name__ == "__main__":

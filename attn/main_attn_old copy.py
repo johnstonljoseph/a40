@@ -5,13 +5,17 @@ import os
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import torch.nn as nn
 import time
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, Sequence
-from transformers import LlamaForCausalLM, LlamaModel
+from transformers.models.olmo3 import Olmo3ForCausalLM, Olmo3Model, modeling_olmo3
+from transformers.models.olmo3.modeling_olmo3 import repeat_kv, ALL_ATTENTION_FUNCTIONS
 from tqdm.auto import tqdm
 
 from .quant import QuantLinear
@@ -22,110 +26,29 @@ DIR = Path(__file__).resolve().parent
 
 @dataclass
 class Config:
-    steps: int = 8000
-    batch_size: int = 4
-    seq_len: int = 512
+    steps: int = 2000
+    batch_size: int = 5
+    seq_len: int = 1024
+    accumulate_steps: int = 4
     lr: float = 5e-6
     device: str = "cuda"
     dtype: str = "bfloat16"
-    base_path: str = "/workspace/.hf_home/hub/models--allenai--Llama-3.1-Tulu-3.1-8B"
-    # models--meta-llama--Llama-3.2-1B-Instruct"
-    # base_path: str = "/Users/joseph/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct"
-    dataset_a: str = "allenai/tulu-3-sft-mixture"
-    dataset_b: str = "mlfoundations/dclm-baseline-1.0"
-    dataset_ratio_a: float = 0.5
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.3
+    dataset_ratio_dpo: float = 0.3
+    dataset_ratio_rl: float = 0.4
     dataset_split: str = "train"
-    shuffle_buffer_size: int = 10_000
-    seed: int = 0
-    num_workers: int = 1
-    checkpoint_interval: int = 2000
+    shuffle_buffer_size: int = 100
+    seed: int = 42
+    num_workers: int = 0
+    checkpoint_interval: int = 16000
     starting_step: int = 0
     train_layers: Optional[tuple[int, ...]] = field(default=None)
-    penalty_scale: float = 0
-    margin_weight: float = 0.0
-    align_weight: float = 32.0
-
-
-def parse_args() -> Config:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--steps", type=int, default=Config.steps)
-    parser.add_argument("--batch-size", dest="batch_size", type=int, default=Config.batch_size)
-    parser.add_argument(
-        "--seq-len",
-        dest="seq_len",
-        type=int,
-        default=Config.seq_len,
-        help="Sequence length for packed training batches",
-    )
-    parser.add_argument(
-        "--train-layers",
-        type=str,
-        default="all",
-        help="Comma-separated decoder layer indices to finetune or 'all' (default)",
-    )
-    parser.add_argument(
-        "--checkpoint-interval",
-        type=int,
-        default=Config.checkpoint_interval,
-        help="Save a checkpoint every N steps (0 to disable)",
-    )
-    parser.add_argument(
-        "--starting-step",
-        type=int,
-        default=Config.starting_step,
-        help="Step number to begin training from (0 to start fresh).",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=Config.device,
-        help="Device to run distillation on (e.g., cuda:x or cpu).",
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default=Config.dtype,
-        help="Torch dtype for loading models (e.g., float32, bfloat16).",
-    )
-    parser.add_argument(
-        "--weight-penalty-scale",
-        type=float,
-        default=Config.penalty_scale,
-        help="Multiplier for quant weight penalty loss.",
-    )
-    parser.add_argument(
-        "--margin-weight",
-        type=float,
-        default=Config.margin_weight,
-        help="Weight for margin component in anchor loss.",
-    )
-    parser.add_argument(
-        "--align-weight",
-        type=float,
-        default=Config.align_weight,
-        help="Weight for align (teacher top-1) component in anchor loss.",
-    )
-    args = parser.parse_args()
-    raw_train_layers = args.train_layers.strip()
-    train_layers = (
-        None
-        if raw_train_layers.lower() == "all"
-        else tuple(int(tok) for tok in raw_train_layers.split(",") if tok.strip())
-    )
-    return Config(
-        steps=args.steps,
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        train_layers=train_layers,
-        checkpoint_interval=args.checkpoint_interval,
-        starting_step=args.starting_step,
-        device=args.device,
-        dtype=args.dtype,
-        penalty_scale=args.weight_penalty_scale,
-        margin_weight=args.margin_weight,
-        align_weight=args.align_weight,
-    )
-
+    compile: bool = True
+    lambda_steps: int = 100
 
 def checkpoint_path(step: int) -> Path:
     return DIR / "checkpoints" / f"step_{step}.pt"
@@ -160,15 +83,78 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
-def spikes_penalty(model: torch.nn.Module) -> torch.Tensor:
-    """Aggregate quant penalties; always returns a tensor on model device."""
-    first_param = next(model.parameters(), None)
-    device = first_param.device if first_param is not None else torch.device("cpu")
-    total = torch.tensor(0.0, device=device)
-    for module in model.modules():
-        if isinstance(module, QuantLinear) and module.last_penalty is not None:
-            total += module.last_penalty
-    return total
+def activation_mix_at_step(step: int, end: int) -> float:
+    """Cosine anneal mixing coefficient in [0,1]: 0 -> start, 1 -> end (start fixed at 0)."""
+    if step >= end:
+        return 1.0
+    frac = step / float(end)
+    # Cosine from 0 -> 1 over frac in [0,1]
+    return 0.5 * (1.0 - math.cos(math.pi * frac))
+
+
+_ATTN_BLEND: float = 0.0
+
+
+def set_attention_activation_mix(mix: float) -> None:
+    global _ATTN_BLEND
+    _ATTN_BLEND = float(max(0.0, min(1.0, mix)))
+
+
+def softmix_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    # Lazy-init per-head learnable scale s in (0,1) and bias t>0, starting at s=0.5, t=1.0
+    if not hasattr(module, "raw_softmix_scale"):
+        num_heads = module.config.num_attention_heads
+        module.register_parameter(
+            "raw_softmix_scale",
+            nn.Parameter(torch.zeros(num_heads, 1, 1, device=query.device, dtype=query.dtype)),
+        )
+    if not hasattr(module, "raw_softmix_bias"):
+        # softplus^{-1}(1.0) = log(exp(1)-1)
+        init_bias = math.log(math.e - 1.0)
+        num_heads = module.config.num_attention_heads
+        module.register_parameter(
+            "raw_softmix_bias",
+            nn.Parameter(torch.full((num_heads, 1, 1), init_bias, device=query.device, dtype=query.dtype)),
+        )
+    s = torch.sigmoid(module.raw_softmix_scale).view(1, -1, 1, 1)
+    t = F.softplus(module.raw_softmix_bias).view(1, -1, 1, 1)
+
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    attn_logits = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_logits = attn_logits + causal_mask
+
+    logits = attn_logits
+    soft = nn.functional.softmax(logits, dim=-1, dtype=torch.float32)
+
+    poly = torch.clamp(s * logits + t, min=0.0)
+    poly_sum = poly.sum(dim=-1, keepdim=True)
+    poly = torch.where(poly_sum > 0, poly / poly_sum, soft)
+
+    attn_weights = ((1.0 - _ATTN_BLEND) * soft + _ATTN_BLEND * poly).to(query.dtype)
+
+    # attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+
+def prepare_attention_activation_mix(model: Olmo3Model) -> None:
+    """Placeholder to mirror call sites; no-op since attention uses fixed softmax."""
+    return None
 
 
 def quant_max_activation(model: torch.nn.Module) -> tuple[float | None, str | None]:
@@ -183,8 +169,8 @@ def quant_max_activation(model: torch.nn.Module) -> tuple[float | None, str | No
     return best_val, best_name
 
 
-def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> LlamaForCausalLM:
-    model = LlamaForCausalLM.from_pretrained(model_path, dtype=dtype)
+def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> Olmo3ForCausalLM:
+    model = Olmo3ForCausalLM.from_pretrained(model_path, dtype=dtype)
     model.config.use_cache = False
     model.eval()
     model = model.to(device)
@@ -197,17 +183,18 @@ def freeze_model(model: torch.nn.Module) -> None:
 
 
 def prepare_quant_layers(
-    llama_model: LlamaModel,
+    model: Olmo3Model,
     train_layers: tuple[int, ...],
     set_scales: bool = False
 ) -> None:
-    for layer_index, layer in enumerate(llama_model.layers):
+    for layer_index, layer in enumerate(model.layers):
         if layer_index not in train_layers:
             continue
         groups = [
             (layer.self_attn, "q_k_v"),
             (layer.self_attn, "o"),
             (layer.mlp, "gate_up"),
+            (layer.mlp, "down")
         ]
         for parent_module, group_name in groups:
             act_calib_payload = torch.load(activation_calib_path(layer_index, group_name), map_location="cpu")
@@ -226,7 +213,7 @@ def prepare_quant_layers(
                 quant.q_name = f"layer{layer_index}.{parent_module.__class__.__name__}.{name}"
                 
                 if set_scales:
-                    quant.set_activation_scale(clip_value)
+                    # quant.set_activation_scale(clip_value)
                     calib_weight_payload = torch.load(weight_calib_path(layer_index, name), map_location="cpu")
                     quant.set_weight_scales(calib_weight_payload.get("scales"))
 
@@ -238,7 +225,7 @@ def iter_layer_linears(
 
     targets = (
         ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")),
-        ("mlp", ("gate_proj", "up_proj")),
+        ("mlp", ("gate_proj", "up_proj", "down_proj")),
     )
 
     for layer_index, layer in enumerate(layers):
@@ -255,7 +242,7 @@ def iter_layer_linears(
 
 def load_checkpoint(
     checkpoint_path: str,
-    model: LlamaForCausalLM,
+    model: Olmo3ForCausalLM,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     map_location: Optional[torch.device] = None,
@@ -267,6 +254,32 @@ def load_checkpoint(
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
+
+
+def ensure_adamw_state_dtype(optimizer: torch.optim.AdamW, target_dtype: torch.dtype) -> None:
+    """Make sure AdamW moment tensors live in the desired dtype (bf16 support)."""
+    if target_dtype != torch.bfloat16:
+        return
+
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param is None or not param.requires_grad:
+                continue
+            state = optimizer.state[param]
+            if "exp_avg" in state:
+                state["exp_avg"] = state["exp_avg"].to(dtype=target_dtype)
+            else:
+                state["exp_avg"] = torch.zeros_like(
+                    param, dtype=target_dtype, memory_format=torch.preserve_format
+                )
+            if "exp_avg_sq" in state:
+                state["exp_avg_sq"] = state["exp_avg_sq"].to(dtype=target_dtype)
+            else:
+                state["exp_avg_sq"] = torch.zeros_like(
+                    param, dtype=target_dtype, memory_format=torch.preserve_format
+                )
+            if "step" not in state:
+                state["step"] = torch.zeros((), device=param.device, dtype=torch.int64)
 
 
 def compute_kl_loss(
@@ -300,35 +313,6 @@ def compute_token_cross_entropy(
         return torch.tensor(0.0, device=logits.device)
     return (loss * shift_mask).sum() / mask_sum
 
-
-def compute_anchor_loss(
-    student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    attention_mask: torch.Tensor,
-    align_weight: float = 1.0,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-]:
-    mask = attention_mask.float()
-    temp = 4.0
-    teacher_idx = teacher_logits.argmax(dim=-1)
-    student_log_probs = F.log_softmax(student_logits / temp, dim=-1)
-    align_loss = -student_log_probs.gather(-1, teacher_idx.unsqueeze(-1)).squeeze(-1)
-
-    denom = mask.sum()
-    align = (align_loss * mask).sum() / denom
-
-    grad_align = torch.autograd.grad(align, student_logits, retain_graph=True)[0]
-    grad_align_top = (grad_align.gather(-1, teacher_idx.unsqueeze(-1)).squeeze(-1) * mask).sum() / denom
-    grad_align_norm = torch.sqrt((grad_align.pow(2).sum(dim=-1) * mask).sum() / denom)
-
-    return (
-        (align_weight * align_loss * mask).sum() / denom,
-        align,
-        grad_align_top,
-        grad_align_norm,
-    )
 
 
 def argmax_stability_metrics(
@@ -392,7 +376,8 @@ def argmax_stability_metrics(
     }
 
 
-def run(cfg: Config) -> None:
+def main() -> None:
+    cfg = Config()
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
@@ -412,41 +397,74 @@ def run(cfg: Config) -> None:
         print("[run] resolving model path...", flush=True)
     base_path = resolve_model_path(cfg.base_path)
 
+    ALL_ATTENTION_FUNCTIONS["teacher"] = modeling_olmo3.eager_attention_forward
+    ALL_ATTENTION_FUNCTIONS["student"] = softmix_attention_forward
     if rank == 0:
         print("[run] loading teacher model...", flush=True)
     teacher = load_model(base_path, device, dtype)
+    teacher.model.config._attn_implementation = "teacher"
 
     if rank == 0:
         print("[run] loading student model...", flush=True)
     student = copy.deepcopy(teacher)
+    student.model.config._attn_implementation = "student"
+    if rank == 0:
+        print(f"[run] attention impl: teacher={teacher.model.config._attn_implementation}, student={student.model.config._attn_implementation}", flush=True)
     freeze_model(teacher)
-    # Freeze only embedding and lm_head, train everything else
-    student.model.embed_tokens.requires_grad_(False)
-    student.lm_head.requires_grad_(False)
     target_layers = cfg.train_layers
     if target_layers is None:
         target_layers = tuple(range(len(student.model.layers)))
-    prepare_quant_layers(
-        student.model,
-        target_layers,
-        cfg.starting_step == 0
-    )
+    # attention already aligned; no additional patching needed
 
-    # Enable activation checkpointing to cut memory in half for long sequences
-    student.gradient_checkpointing_enable(use_reentrant=False)
+    if cfg.compile:
+        if rank == 0:
+            print("[run] compiling student with torch.compile...", flush=True)
+        student = torch.compile(
+            student,
+            fullgraph=False,
+            options={"triton.cudagraphs": False},  # avoid cudagraph capture issues
+        )
+        if rank == 0:
+            print("[run] student compile finished", flush=True)
+
+    # Cut activation memory; safe with grad accumulation
+    # student.gradient_checkpointing_enable()
 
     if distributed:
         student = DDP(student, device_ids=[rank], output_device=rank)
 
+    # Separate LR for activation scales (log_act_s): 50x base LR
+    act_params: list[torch.nn.Parameter] = []
+    leaky_params: list[torch.nn.Parameter] = []
+    other_params: list[torch.nn.Parameter] = []
+    for name, param in student.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.endswith("log_act_s"):
+            act_params.append(param)
+        elif ".act_fn." in name:
+            leaky_params.append(param)
+        else:
+            other_params.append(param)
+
     beta2 = 0.95 if use_bf16 else 0.999
     eps = 1e-10 if use_bf16 else 1e-8
+    param_groups: list[dict[str, object]] = []
+    if other_params:
+        param_groups.append({"params": other_params, "lr": cfg.lr})
+    if act_params:
+        param_groups.append({"params": act_params, "lr": cfg.lr * 50.0})
+    if leaky_params:
+        param_groups.append({"params": leaky_params, "lr": cfg.lr})
     optimizer = torch.optim.AdamW(
-        student.parameters(),
+        param_groups,
         lr=cfg.lr,
         betas=(0.9, beta2),
         eps=eps,
         weight_decay=0.1,
+        foreach=False,  # avoid multi-tensor grouping dtype issues with bf16 state casting
     )
+    ensure_adamw_state_dtype(optimizer, dtype)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.steps, eta_min=cfg.lr * 0.1
     )
@@ -463,6 +481,7 @@ def run(cfg: Config) -> None:
             scheduler,
             map_location=device,
         )
+        ensure_adamw_state_dtype(optimizer, dtype)
     if rank == 0:
         print(f"[run] resumed from step {start_step}")
 
@@ -479,7 +498,7 @@ def run(cfg: Config) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         if not log_path.exists():
             with open(log_path, "w") as f:
-                f.write("step,top1_miss,ema_miss,top1_acc,flip_penalty,median_rel_margin,flip_severity\n")
+                f.write("step,kl,top1_miss,ema_miss,top1_acc,flip_penalty,median_rel_margin,flip_severity,max_act,max_act_name\n")
 
     progress = tqdm(
         range(start_step, cfg.steps),
@@ -492,86 +511,101 @@ def run(cfg: Config) -> None:
         disable=(rank != 0),
     )
 
+    log_interval = 12  # reuse checkpoint interval semantics
+
+    last_kl: torch.Tensor | None = None
+    last_top1_miss: torch.Tensor | None = None
+    last_top1_acc: torch.Tensor | None = None
+    last_flip_penalty: torch.Tensor | None = None
+    last_median_rel_margin: torch.Tensor | None = None
+    last_flip_severity: torch.Tensor | None = None
+    last_max_act: float | None = None
+    last_max_act_name: str | None = None
+
     for step in progress:
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
+        current_blend = activation_mix_at_step(step, cfg.lambda_steps)
+        set_attention_activation_mix(current_blend)
 
-        batch = next(batch_iter)
+        # Gradient accumulation over micro-batches
+        for micro in range(cfg.accumulate_steps):
+            batch = next(batch_iter)
 
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        student_logits = student(input_ids=input_ids, attention_mask=attention_mask).logits
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            student_logits = student(input_ids=input_ids, attention_mask=attention_mask).logits
 
-        with torch.no_grad():
-            teacher_logits = teacher(input_ids=input_ids, attention_mask=attention_mask).logits
+            with torch.no_grad():
+                teacher_logits = teacher(input_ids=input_ids, attention_mask=attention_mask).logits
 
-        # with torch.no_grad():
-        #     (
-        #         anchor_loss,
-        #         align_loss,
-        #         grad_align_top,
-        #         grad_align_norm,
-        #     ) = compute_anchor_loss(
-        #         student_logits,
-        #         teacher_logits,
-        #         attention_mask,
-        #         align_weight=cfg.align_weight,
-        #     )
+            with torch.no_grad():
+                metrics = argmax_stability_metrics(teacher_logits, student_logits, attention_mask)
+                top1_acc = metrics["top1_acc"]
+                top1_miss = 1.0 - top1_acc
+                flip_penalty = metrics["avg_flip_penalty"]
+                median_rel_margin = metrics["median_rel_margin"]
+                flip_severity = metrics["avg_flip_severity"]
 
-            metrics = argmax_stability_metrics(teacher_logits, student_logits, attention_mask)
-            top1_acc = metrics["top1_acc"]
-            top1_miss = 1.0 - top1_acc
-            flip_penalty = metrics["avg_flip_penalty"]
-            median_rel_margin = metrics["median_rel_margin"]
-            flip_severity = metrics["avg_flip_severity"]
+            kl_loss = compute_kl_loss(student_logits, teacher_logits, attention_mask)
+            best_act, best_act_name = quant_max_activation(unwrap_model(student))
 
-        # penalty_term = torch.tensor(0.0, device=device)
-        loss = compute_kl_loss(student_logits, teacher_logits, attention_mask)
+            loss = kl_loss / cfg.accumulate_steps
+            loss.backward()
 
-        best_act, best_act_name = quant_max_activation(unwrap_model(student))
+            # Cache last micro metrics for logging outside the accumulation loop
+            last_kl = kl_loss.detach()
+            last_top1_miss = top1_miss.detach()
+            last_top1_acc = top1_acc.detach()
+            last_flip_penalty = flip_penalty.detach()
+            last_median_rel_margin = median_rel_margin.detach()
+            last_flip_severity = flip_severity.detach()
+            last_max_act = best_act
+            last_max_act_name = best_act_name
 
-        loss.backward()
+            # Drop references promptly to release graph memory
+            del teacher_logits, kl_loss, student_logits, loss
 
-        # (teacher_logits - student_logits)
+        # Cast accumulated grads to configured dtype to keep optimizer state consistent
+        for p in student.parameters():
+            if p.grad is not None:
+                p.grad.data = p.grad.data.to(dtype)
 
-        # Overall gradient norms
-        with torch.no_grad():
-            logits_grad_norm = (
-                student_logits.grad.norm().detach()
-                if student_logits.grad is not None
-                else torch.tensor(0.0, device=device)
-            )
-            param_sq_sum = torch.zeros(1, device=device)
-            for p in student.parameters():
-                if p.grad is not None:
-                    param_sq_sum += p.grad.pow(2).sum()
-            param_grad_norm = param_sq_sum.sqrt()
-
+        if use_bf16:
+            ensure_adamw_state_dtype(optimizer, dtype)
         optimizer.step()
         scheduler.step()
 
-        if rank == 0:
-            # Update EMA of top1_miss
-            ema_miss = top1_miss.item() if ema_miss is None else 0.9 * ema_miss + 0.1 * top1_miss.item()
-            # Append to CSV log (rank0)
+        # Fallbacks if somehow caches are None
+        kl_val = last_kl.item() if last_kl is not None else 0.0
+        top1_miss_val = last_top1_miss.item() if last_top1_miss is not None else 0.0
+        top1_acc_val = last_top1_acc.item() if last_top1_acc is not None else 0.0
+        flip_pen_val = last_flip_penalty.item() if last_flip_penalty is not None else 0.0
+        median_rel_val = last_median_rel_margin.item() if last_median_rel_margin is not None else 0.0
+        flip_sev_val = last_flip_severity.item() if last_flip_severity is not None else 0.0
+        max_act_val = last_max_act if last_max_act is not None else 0.0
+        max_act_name = last_max_act_name if last_max_act_name is not None else "n/a"
+
+        if rank == 0 and ((step + 1) % log_interval == 0 or step == start_step):
+            ema_miss = top1_miss_val if ema_miss is None else 0.9 * ema_miss + 0.1 * top1_miss_val
             with open(log_path, "a") as f:
                 f.write(
-                    f"{step},{top1_miss.item():.6f},{ema_miss:.6f},"
-                    f"{top1_acc.item():.6f},{flip_penalty.item():.6f},"
-                    f"{median_rel_margin.item():.6f},{flip_severity.item():.6f}\n"
+                    f"{step},{kl_val:.6f},{top1_miss_val:.6f},{ema_miss:.6f},"
+                    f"{top1_acc_val:.6f},{flip_pen_val:.6f},"
+                    f"{median_rel_val:.6f},{flip_sev_val:.6f},"
+                    f"{max_act_val:.6f},{max_act_name}\n"
                 )
-            max_act_val = best_act if best_act is not None else 0.0
-            max_act_name = best_act_name if best_act_name is not None else "n/a"
-            progress.set_postfix_str(
-                (
-                    # f"align={align_loss.item():.4f} "
-                    f"KL={loss.item():.6f} "
-                    f"max_act={max_act_val:.4f}({max_act_name}) "
-                    f"top1_miss={top1_miss.item():.3f} ema_miss={ema_miss:.3f} "
-                    f"flip_pen={flip_penalty.item():.3f} rel_median={median_rel_margin.item():.3f} "
-                    f"flip_sev={flip_severity.item():.3f} "
-                    f"logit_gn={logits_grad_norm.item():.4f} param_gn={param_grad_norm.item():.4f} "
-                )
+
+        progress.set_postfix_str(
+            (
+                f"blend={current_blend:.3f} "
+                f"kl={kl_val:.4f} "
+                f"max_act={max_act_val:.4f}({max_act_name}) "
+                f"top1_miss={top1_miss_val:.3f} ema_miss={ema_miss if ema_miss is not None else top1_miss_val:.3f} "
+                f"flip_pen={flip_pen_val:.3f} "
+                f"rel_median={median_rel_val:.3f} "
+                f"flip_sev={flip_sev_val:.3f} "
             )
+        )
 
         if cfg.checkpoint_interval > 0 and (step + 1) % cfg.checkpoint_interval == 0:
             if rank == 0:
@@ -589,12 +623,7 @@ def run(cfg: Config) -> None:
 
     if distributed:
         dist.destroy_process_group()
-
-
-def main() -> None:
-    cfg = parse_args()
-    run(cfg)
-
+        
 
 if __name__ == "__main__":
     main()

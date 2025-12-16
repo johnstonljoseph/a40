@@ -13,6 +13,7 @@ from transformers import AutoTokenizer
 def build_dataloader(
     cfg: "Config",
     tokenizer_path: str,
+    seed: int = 0,
     world_size: int = 1,
     rank: int = 0,
 ) -> DataLoader:
@@ -104,12 +105,10 @@ def build_dataloader(
     stream = datasets.interleave_datasets(
         datasets_to_mix,
         probabilities=mix,
-        seed=cfg.seed,
+        seed=seed,
         stopping_strategy="first_exhausted",
     )
-    if cfg.shuffle_buffer_size > 0:
-        stream = stream.shuffle(buffer_size=cfg.shuffle_buffer_size, seed=cfg.seed)
-    stream = stream.repeat(None)
+    stream = stream.shuffle(buffer_size=cfg.shuffle_buffer_size, seed=seed)
     stream = stream.with_format("torch")
 
     if rank == 0:

@@ -5,3 +5,4 @@ tqdm
 datasketches
 lm-eval
 pytest
+matplotlib

@@ -23,6 +23,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=Config.device)
     parser.add_argument("--dtype", type=str, default=Config.dtype)
     parser.add_argument(
+        "--layer-index",
+        type=int,
+        default=None,
+        help="If set, only collect activations for this layer and write a histogram PNG instead of fitting all layers.",
+    )
+    parser.add_argument(
+        "--hist-all",
+        action="store_true",
+        help="If set, write one annotated histogram PNG per layer and exit.",
+    )
+    parser.add_argument(
+        "--hist-dir",
+        type=str,
+        default=str(SCRIPT_DIR / "hists"),
+        help="Output directory for per-layer histogram PNGs (only used with --hist-all).",
+    )
+    parser.add_argument(
+        "--hist-output",
+        type=str,
+        default=str(SCRIPT_DIR / "hist_layer.png"),
+        help="Histogram PNG output path (only used when --layer-index is set).",
+    )
+    parser.add_argument(
+        "--hist-bins",
+        type=int,
+        default=400,
+        help="Number of bins for histogram (only used when --layer-index is set).",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=2_000_000,
+        help="Max number of activation samples to keep for inspection (only used when --layer-index is set).",
+    )
+    parser.add_argument(
+        "--sample-per-call",
+        type=int,
+        default=100_000,
+        help="Max samples to keep from a single hook call when collecting histograms.",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default=str(SCRIPT_DIR / "values.txt"),
@@ -49,6 +90,131 @@ def register_mlp_act_input_hooks(
         handles.append(act_fn.register_forward_hook(hook))
 
     return activations, handles
+
+
+def register_mlp_act_input_hooks_sampled(
+    model: torch.nn.Module,
+    max_samples: int,
+    sample_per_call: int,
+) -> tuple[Dict[int, list[torch.Tensor]], Dict[int, int], list[torch.utils.hooks.RemovableHandle]]:
+    activations: Dict[int, list[torch.Tensor]] = {}
+    counts: Dict[int, int] = {}
+    handles: list[torch.utils.hooks.RemovableHandle] = []
+
+    for layer_index, layer in enumerate(model.model.layers):
+        activations[layer_index] = []
+        counts[layer_index] = 0
+        act_fn = layer.mlp.act_fn
+
+        def hook(_module, inputs, _output, *, _layer_index: int = layer_index):
+            remaining = int(max_samples) - int(counts[_layer_index])
+            if remaining <= 0:
+                return
+            x = inputs[0].detach().float().reshape(-1)
+            take = min(int(sample_per_call), remaining, int(x.numel()))
+            if take <= 0:
+                return
+            if take < int(x.numel()):
+                idx = torch.randint(0, int(x.numel()), (take,), device=x.device)
+                x = x.index_select(0, idx)
+            activations[_layer_index].append(x.cpu())
+            counts[_layer_index] += int(take)
+
+        handles.append(act_fn.register_forward_hook(hook))
+
+    return activations, counts, handles
+
+
+def register_single_mlp_act_input_hook(
+    model: torch.nn.Module,
+    layer_index: int,
+) -> tuple[list[torch.Tensor], torch.utils.hooks.RemovableHandle]:
+    layers = getattr(model, "model").layers
+    if not (0 <= layer_index < len(layers)):
+        raise ValueError(f"Invalid layer index {layer_index}; model has {len(layers)} layers")
+    act_fn = layers[layer_index].mlp.act_fn
+    activations: list[torch.Tensor] = []
+
+    def hook(_module, inputs, _output):
+        x = inputs[0].detach().float().reshape(-1)
+        activations.append(x)
+
+    handle = act_fn.register_forward_hook(hook)
+    return activations, handle
+
+
+def print_activation_stats(z: torch.Tensor) -> None:
+    z = z.detach().float().reshape(-1)
+    z_min = float(z.min().item())
+    z_max = float(z.max().item())
+    qs = torch.tensor([0.9, 0.99, 0.999], dtype=torch.float32, device=z.device)
+    qv = torch.quantile(z, qs).cpu().tolist()
+    print(f"[inspect] min={z_min:.6f} max={z_max:.6f}", flush=True)
+    print(
+        f"[inspect] p90={qv[0]:.6f} p99={qv[1]:.6f} p999={qv[2]:.6f}",
+        flush=True,
+    )
+
+
+def format_activation_stats(z: torch.Tensor) -> str:
+    z = z.detach().float().reshape(-1)
+    z_min = float(z.min().item())
+    z_max = float(z.max().item())
+    qs = torch.tensor([0.9, 0.99, 0.999], dtype=torch.float32, device=z.device)
+    qv = torch.quantile(z, qs).cpu().tolist()
+    return (
+        f"min {z_min:.4f}\n"
+        f"max {z_max:.4f}\n"
+        f"p90 {qv[0]:.4f}\n"
+        f"p99 {qv[1]:.4f}\n"
+        f"p999 {qv[2]:.4f}"
+    )
+
+
+def save_histogram_png(
+    z: torch.Tensor,
+    out_path: Path,
+    bins: int,
+    title: str,
+    stats_text: str,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(
+            f"[inspect] skipping histogram PNG (matplotlib unavailable): {e}",
+            flush=True,
+        )
+        return
+
+    z = z.detach().float().reshape(-1)
+    qs = torch.tensor([0.001, 0.999], dtype=torch.float32, device=z.device)
+    q_lo, q_hi = torch.quantile(z, qs).cpu().tolist()
+    z_np = z.cpu().numpy()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
+    ax.hist(z_np, bins=bins, range=(q_lo, q_hi), density=False)
+    ax.set_title(title)
+    ax.set_xlabel("activation value")
+    ax.set_ylabel("count")
+    ax.grid(True, alpha=0.2)
+    ax.text(
+        0.98,
+        0.98,
+        stats_text,
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9,
+        bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "none"},
+    )
+    fig.tight_layout()
+    fig.savefig(str(out_path))
+    plt.close(fig)
 
 
 def silu_and_grad(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -133,7 +299,20 @@ def main() -> None:
     )
     model = load_model(model_path, device, dtype)
 
-    activations, handles = register_mlp_act_input_hooks(model)
+    if args.layer_index is not None and args.hist_all:
+        raise ValueError("Use either --layer-index or --hist-all, not both")
+
+    if args.layer_index is not None:
+        layer_index = int(args.layer_index)
+        activations_single, handle = register_single_mlp_act_input_hook(model, layer_index)
+    elif args.hist_all:
+        activations, counts, handles = register_mlp_act_input_hooks_sampled(
+            model,
+            max_samples=int(args.max_samples),
+            sample_per_call=int(args.sample_per_call),
+        )
+    else:
+        activations, handles = register_mlp_act_input_hooks(model)
 
     cfg = Config(batch_size=args.batch_size, seq_len=args.seq_len, shuffle_buffer_size=0)
     dataloader = build_dataloader(
@@ -156,8 +335,59 @@ def main() -> None:
             attention_mask = batch["attention_mask"].to(device)
             model(input_ids=input_ids, attention_mask=attention_mask)
 
-    for handle in handles:
+            if args.layer_index is not None and len(activations_single) > 0:
+                total = sum(int(x.numel()) for x in activations_single)
+                if total >= int(args.max_samples):
+                    break
+
+    if args.layer_index is not None:
         handle.remove()
+        if len(activations_single) == 0:
+            raise RuntimeError("No activations collected (did the model run any forward passes?)")
+        z = torch.cat(activations_single, dim=0)
+        if z.numel() > int(args.max_samples):
+            z = z[: int(args.max_samples)]
+        print(f"[inspect] layer={args.layer_index} samples={int(z.numel())}", flush=True)
+        print_activation_stats(z)
+        save_histogram_png(
+            z,
+            Path(args.hist_output),
+            bins=int(args.hist_bins),
+            title=f"Layer {args.layer_index} act_fn input histogram (clipped to [p0.1%, p99.9%])",
+            stats_text=format_activation_stats(z),
+        )
+        print(f"[inspect] wrote histogram: {args.hist_output}", flush=True)
+        os._exit(0)
+    elif args.hist_all:
+        for handle in handles:
+            handle.remove()
+        out_dir = Path(args.hist_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        num_layers = len(activations)
+        print(
+            f"[inspect] writing histograms for {num_layers} layers to {out_dir} (max_samples={int(args.max_samples)})",
+            flush=True,
+        )
+        for layer_index in sorted(activations.keys()):
+            if len(activations[layer_index]) == 0:
+                continue
+            z = torch.cat(activations[layer_index], dim=0)
+            if z.numel() > int(args.max_samples):
+                z = z[: int(args.max_samples)]
+            stats_text = format_activation_stats(z)
+            out_path = out_dir / f"layer_{layer_index:02d}.png"
+            save_histogram_png(
+                z,
+                out_path,
+                bins=int(args.hist_bins),
+                title=f"Layer {layer_index} act_fn input histogram (clipped to [p0.1%, p99.9%])",
+                stats_text=stats_text,
+            )
+        print(f"[inspect] wrote histogram directory: {out_dir}", flush=True)
+        os._exit(0)
+    else:
+        for handle in handles:
+            handle.remove()
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
