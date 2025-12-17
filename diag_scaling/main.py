@@ -91,8 +91,8 @@ def register_collectors(
     handles: List[torch.utils.hooks.RemovableHandle] = []
 
     for layer_index, _parent, name, child in iter_layer_linears(model.model.layers):
-        if name != "down_proj":
-            # Only collect stats for down projections for now.
+        if name not in ("gate_proj", "up_proj"):
+            # Only collect stats for gate/up projections.
             continue
         if layer_index not in target_layers:
             continue

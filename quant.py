@@ -38,11 +38,6 @@ class QuantFn(torch.autograd.Function):
     def forward(ctx, x, s, qmax) -> torch.Tensor:
         # x: [batch_size, seq_len, hidden_size]
         # s: [] if per tensor, [out_features] if per channel
-        # x_h = hadamard_transform(x.contiguous())
-        # y = x / s
-        # q = y.clamp(-qmax, qmax-1).round()
-        # xhat_h = q * s
-        # xhat = hadamard_transform(xhat_h.contiguous(), transpose=True)
         y = x / s
         q = y.clamp(-qmax, qmax-1).round()
         xhat = q * s
@@ -62,7 +57,7 @@ class QuantFn(torch.autograd.Function):
         return grad_x, grad_s, None
 
 
-class QuantLinear(nn.Module):
+class QuantLinearWithWeights(nn.Module):
     def __init__(
         self,
         in_features,
@@ -83,16 +78,14 @@ class QuantLinear(nn.Module):
         x_q = QuantFn.apply(x, act_scale, self.qmax)
         w_q = QuantFn.apply(self.weight, weight_scale, self.qmax)
         y = F.linear(x_q, w_q)
-        # y = F.linear(x, w_q)
 
         # # Dynamically quantize activations and use real-valued weights.
         # with torch.no_grad():
         #     max_abs_x = x.detach().abs().amax()
         #     act_scale = (max_abs_x / self.qmax).clamp(min=torch.finfo(x.dtype).eps)
         # x_q = QuantFn.apply(x, act_scale.to(dtype=x.dtype, device=x.device), self.qmax)
-        # y = F.linear(x_q, w_q)
-        max_val = torch.max(x.abs().max(), y.abs().max())
 
+        max_val = torch.max(x.abs().max(), y.abs().max())
         self.last_max_act = max_val.detach()
         return y
 
@@ -111,14 +104,11 @@ class QuantLinear(nn.Module):
 
     def set_trainable(self, enabled: bool) -> None:
         self.weight.requires_grad = enabled
-        self.log_weight_s.requires_grad = enabled
         self.log_act_s.requires_grad = enabled
+        self.log_weight_s.requires_grad = enabled
 
 
-
-
-
-class DiagScalingLinear(nn.Module):
+class QuantLinearWithScales(nn.Module):
     def __init__(
         self,
         in_features: int,
@@ -128,20 +118,20 @@ class DiagScalingLinear(nn.Module):
         super().__init__()
         self.qmax = 1 << (int(bits) - 1)
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
-        self.log_diag = nn.Parameter(torch.zeros(in_features))
         self.log_act_s = nn.Parameter(torch.zeros(()))
+        self.log_diag_s = nn.Parameter(torch.zeros(in_features))
         self.q_name: str | None = None
         self.last_max_act: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() < 2:
             raise ValueError(f"Expected at least 2-D tensor, got shape {tuple(x.shape)}")
-        if self.log_diag.numel() != x.shape[-1]:
+        if self.log_diag_s.numel() != x.shape[-1]:
             raise ValueError(
-                f"Incompatible SmoothQuant scales: {self.log_diag.numel()} vs hidden size {x.shape[-1]}"
+                f"Incompatible SmoothQuant scales: {self.log_diag_s.numel()} vs hidden size {x.shape[-1]}"
             )
-        inv = (-self.log_diag).exp().to(dtype=x.dtype, device=x.device)
-        diag = self.log_diag.exp().to(dtype=self.weight.dtype, device=self.weight.device)
+        inv = (-self.log_diag_s).exp().to(dtype=x.dtype, device=x.device)
+        diag = self.log_diag_s.exp().to(dtype=self.weight.dtype, device=self.weight.device)
         view_shape = (1,) * (x.dim() - 1) + (inv.numel(),)
         x_scaled = x * inv.view(view_shape)
         act_scale = self.log_act_s.exp().to(dtype=x_scaled.dtype, device=x_scaled.device)
@@ -153,7 +143,7 @@ class DiagScalingLinear(nn.Module):
             self.last_max_act = max_val
         return y
 
-    def set_diag_scales(self, payload: Dict[str, Any]) -> None:
+    def set_scales(self, payload: Dict[str, Any]) -> None:
         scales = payload["scales"]
         act_percentile = payload["act_percentile"]
         scales = scales.to(device=self.weight.device, dtype=self.weight.dtype)
@@ -162,20 +152,16 @@ class DiagScalingLinear(nn.Module):
         safe_scales = torch.clamp(scales, min=eps)
 
         ratio = act_percentile / safe_scales
-        clip_value = torch.quantile(ratio.reshape(-1).to(torch.float32), 0.99).item()
+        clip_value = torch.quantile(ratio.reshape(-1).to(torch.float32), 0.995).item()
         with torch.no_grad():
-            self.log_diag.copy_(safe_scales.log().to(device=self.log_diag.device, dtype=self.log_diag.dtype))
+            self.log_diag_s.copy_(safe_scales.log().to(device=self.log_diag_s.device, dtype=self.log_diag_s.dtype))
             scale = torch.as_tensor(clip_value / float(self.qmax), dtype=self.log_act_s.dtype, device=self.log_act_s.device)
             self.log_act_s.copy_(scale.clamp(min=torch.finfo(scale.dtype).eps).log())
 
     def set_trainable(self, enabled: bool) -> None:
         self.weight.requires_grad = enabled
-        self.log_diag.requires_grad = enabled
         self.log_act_s.requires_grad = enabled
-
-
-
-
+        self.log_diag_s.requires_grad = enabled
 
 
 

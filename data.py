@@ -117,6 +117,6 @@ def build_dataloader(
     return DataLoader(
         stream,
         batch_size=cfg.batch_size,
-        num_workers=0,
+        num_workers=cfg.num_workers,
         pin_memory=torch.cuda.is_available(),
     )

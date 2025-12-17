@@ -128,6 +128,20 @@ def maybe_compile(teacher, student, rank: int) -> tuple[nn.Module, nn.Module]:
     (teacher, student)
 
 
+def argmax_stability_metrics(
+    teacher_logits: torch.Tensor,
+    student_logits: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> tuple[float, float]:
+    teacher_argmax = teacher_logits.argmax(dim=-1)
+    student_argmax = student_logits.argmax(dim=-1)
+    mask = attention_mask.to(dtype=teacher_argmax.dtype)
+    correct = (teacher_argmax == student_argmax).to(dtype=mask.dtype)
+    top1_acc = (correct * mask).sum() / mask.sum()
+    flip_pen = ((teacher_argmax != student_argmax) * mask).sum() / mask.sum()
+    return top1_acc.item(), flip_pen.item()
+
+
 
 class WeightedRMSNorm(torch.nn.Module):
     """RMSNorm variant that assumes upstream weights already include the gamma scale.

@@ -16,7 +16,7 @@ from typing import Iterable, Iterator, Optional, Sequence
 from transformers.models.olmo3 import Olmo3ForCausalLM, Olmo3Model
 from tqdm.auto import tqdm
 
-from .quant import QuantLinear
+from .quant import QuantLinearWithWeights
 from .data import build_dataloader
 
 DIR = Path(__file__).resolve().parent
@@ -25,7 +25,7 @@ DIR = Path(__file__).resolve().parent
 @dataclass
 class Config:
     steps: int = 8000
-    batch_size: int = 3
+    batch_size: int = 8
     seq_len: int = 1024
     accumulate_steps: int = 16
     lr: float = 5e-6
@@ -36,9 +36,9 @@ class Config:
     dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
     dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
     dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
-    dataset_ratio_sft: float = 0.4
-    dataset_ratio_dpo: float = 0.3
-    dataset_ratio_rl: float = 0.3
+    dataset_ratio_sft: float = 0.6
+    dataset_ratio_dpo: float = 0.2
+    dataset_ratio_rl: float = 0.2
     shuffle_buffer_size: int = 1000
     seed: int = 0
     num_workers: int = 0
@@ -175,7 +175,7 @@ def quant_max_activation(model: torch.nn.Module) -> tuple[float | None, str | No
     best_val: float | None = None
     best_name: str | None = None
     for module in model.modules():
-        if isinstance(module, QuantLinear) and module.last_max_act is not None:
+        if isinstance(module, QuantLinearWithWeights) and module.last_max_act is not None:
             val = float(module.last_max_act)
             if (best_val is None) or (val > best_val):
                 best_val = val
@@ -217,7 +217,7 @@ def prepare_quant_layers(
 
             for name in [f"{prefix}_proj" for prefix in group_name.split("_")]:
                 linear_module = getattr(parent_module, name)
-                quant = QuantLinear(
+                quant = QuantLinearWithWeights(
                     linear_module.in_features,
                     linear_module.out_features,
                 )
@@ -455,20 +455,20 @@ def run(cfg: Config) -> None:
         else:
             other_params.append(param)
 
-    beta2 = 0.95 if use_bf16 else 0.999
-    eps = 1e-10 if use_bf16 else 1e-8
+    # beta2 = 0.95 if use_bf16 else 0.999
+    # eps = 1e-10 if use_bf16 else 1e-8
     optimizer = torch.optim.AdamW(
         [
             {"params": other_params, "lr": cfg.lr},
             {"params": act_params, "lr": cfg.lr * 50.0},
         ],
         lr=cfg.lr,
-        betas=(0.9, beta2),
-        eps=eps,
-        weight_decay=0.0,
+        # betas=(0.9, beta2),
+        # eps=eps,
+        weight_decay=0.1,
         foreach=False,  # avoid multi-tensor grouping dtype issues with bf16 state casting
     )
-    ensure_adamw_state_dtype(optimizer, dtype)
+    # ensure_adamw_state_dtype(optimizer, dtype)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.steps, eta_min=cfg.lr * 0.1
     )

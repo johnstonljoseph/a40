@@ -44,7 +44,7 @@ def test_quant_linear_quant_fn_matches_manual_solution(in_features, out_features
 
     batch_size = 1
     seq_len = 1
-    quant_layer = quant.QuantLinear(in_features, out_features, bits=4)
+    quant_layer = quant.QuantLinearWithWeights(in_features, out_features, bits=4)
     with torch.no_grad():
         quant_layer.weight.copy_(linear.weight)
 

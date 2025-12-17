@@ -16,7 +16,7 @@ from typing import Iterable, Iterator, Optional, Sequence
 from transformers.models.olmo3 import Olmo3ForCausalLM, Olmo3Model
 from tqdm.auto import tqdm
 
-from .quant import QuantLinear, DiagScalingLinear
+from .quant import QuantLinearWithWeights, QuantLinearWithScales
 from .data import build_dataloader
 
 DIR = Path(__file__).resolve().parent
@@ -27,7 +27,7 @@ class Config:
     steps: int = 2000
     batch_size: int = 6
     seq_len: int = 1024
-    accumulate_steps: int = 4
+    accumulate_steps: int = 1
     lr: float = 1e-6
     device: str = "cuda"
     dtype: str = "bfloat16"
@@ -184,7 +184,7 @@ def quant_max_activation(model: torch.nn.Module) -> tuple[float | None, str | No
     best_val: float | None = None
     best_name: str | None = None
     for module in model.modules():
-        if isinstance(module, (QuantLinear, DiagScalingLinear)) and module.last_max_act is not None:
+        if isinstance(module, (QuantLinearWithWeights, QuantLinearWithScales)) and module.last_max_act is not None:
             val = float(module.last_max_act)
             if (best_val is None) or (val > best_val):
                 best_val = val
@@ -245,7 +245,7 @@ def prepare_quant_layers(
                 if not diag_path.exists():
                     continue
 
-                diag_linear = DiagScalingLinear(
+                diag_linear = QuantLinearWithScales(
                     linear_module.in_features,
                     linear_module.out_features,
                 )
@@ -256,7 +256,7 @@ def prepare_quant_layers(
                 diag_linear.q_name = f"layer{layer_index}.{parent_module.__class__.__name__}.{name}"
 
                 diag_payload = torch.load(diag_path, map_location="cpu")
-                diag_linear.set_diag_scales(diag_payload)
+                diag_linear.set_scales(diag_payload)
                 
                 # if set_scales:
                 #     # Set activation scale
