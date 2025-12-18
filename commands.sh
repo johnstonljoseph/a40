@@ -16,6 +16,8 @@ python -m a40.main_relu --no-compile
 
 TOKENIZERS_PARALLELISM=false torchrun --standalone --nproc_per_node=8 -m a40.custom.main
 
+python -m a40.custom.main
+
 
 
 # Eval

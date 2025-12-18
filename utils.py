@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from transformers import AutoModelForCausalLM
 from transformers.models.olmo3 import Olmo3ForCausalLM
 
 
@@ -32,19 +33,8 @@ def resolve_model_path(path_str: str) -> str:
     )
 
 
-def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> Olmo3ForCausalLM:
-    model = Olmo3ForCausalLM.from_pretrained(model_path, dtype=dtype)
-    model.config.use_cache = False
-    model.eval()
-    model = model.to(device)
-    return model
-
-
-def load_custom_model(model_path: str, device: torch.device, dtype: torch.dtype) -> Olmo3ForCausalLM:
-    # Lazy import to avoid circular dependency: custom_model depends on utils. 
-    from a40.custom_model import MyOlmo3ForCausalLM
-
-    model = MyOlmo3ForCausalLM.from_pretrained(model_path, dtype=dtype)
+def load_model(model_path: str, device: torch.device, dtype: torch.dtype):
+    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype)
     model.config.use_cache = False
     model.eval()
     model = model.to(device)

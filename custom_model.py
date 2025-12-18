@@ -1,15 +1,13 @@
-from transformers.models.olmo3 import Olmo3ForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
+from transformers.models.olmo3 import Olmo3Config, Olmo3ForCausalLM
 import torch.nn as nn
 
-from a40.utils import WeightedRMSNorm
 from a40.quant import QuantLinearWithWeights
 from a40.custom.activation import IdentityActivation
 
 
-def _wrap_norm(norm_module):
-    if isinstance(norm_module, WeightedRMSNorm):
-        return norm_module
-    return WeightedRMSNorm(norm_module)
+class MyOlmo3Config(Olmo3Config):
+    model_type = "my_olmo3"
 
 
 class MyOlmo3ForCausalLM(Olmo3ForCausalLM):
@@ -17,6 +15,7 @@ class MyOlmo3ForCausalLM(Olmo3ForCausalLM):
     Variant of Olmo3ForCausalLM whose post-attention / post-MLP / final norms
     are replaced with WeightedRMSNorm so gamma can be fused into neighboring linears.
     """
+    config_class = MyOlmo3Config
 
     def __init__(self, config):
         super().__init__(config)
@@ -54,6 +53,11 @@ class MyOlmo3MLP(nn.Module):
     def forward(self, x):
         down_proj = self.down_proj(self.gate_proj(x) * self.up_proj(x))
         return down_proj
+
+
+# Enable auto-loading of the quantized subclass via AutoModelForCausalLM/AutoConfig
+AutoConfig.register(MyOlmo3Config.model_type, MyOlmo3Config, exist_ok=True)
+AutoModelForCausalLM.register(MyOlmo3Config, MyOlmo3ForCausalLM, exist_ok=True)
 
 
 
