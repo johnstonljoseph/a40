@@ -13,15 +13,46 @@ from .main import (
     Config,
     load_checkpoint,
     load_model,
+    load_custom_model,
     resolve_model_path,
     prepare_quant_layers,
 )
 
 
-DEFAULT_CHECKPOINTS_DIR = Path(
-    # "/Users/joseph/Library/CloudStorage/GoogleDrive-johnstonljoseph@gmail.com/My Drive/a40/checkpoints"
-    "/workspace/a40/checkpoints"
-)
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a quantized checkpoint via lm_eval.")
+    parser.add_argument(
+        "--checkpoints-dir",
+        type=str,
+        default="/workspace/a40/checkpoints/student_final",
+        help="Directory containing checkpoint files (step_<n>.pt).",
+    )
+    parser.add_argument(
+        "--checkpoint-step",
+        type=int,
+        default=1000,
+        help="Training step whose checkpoint should be evaluated.",
+    )
+    parser.add_argument("--batch-size", type=int, default=Config.batch_size)
+    parser.add_argument("--seq-len", type=int, default=Config.seq_len)
+    parser.add_argument("--device", type=str, default=Config.device)
+    parser.add_argument("--dtype", type=str, default=Config.dtype)
+    parser.add_argument(
+        "--tasks",
+        type=str,
+        nargs="+",
+        default=["gsm8k"],
+        help="Whitespace-separated lm_eval task names.",
+    )
+    parser.add_argument("--num-fewshot", type=int, default=5)
+    parser.add_argument("--limit", type=float, default=0.05, help="Optional fraction per task (e.g., 0.01).")
+    parser.add_argument("--output", type=str, default="eval_results.json")
+    args = parser.parse_args()
+    args.base_path = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    checkpoints_dir = Path(args.checkpoints_dir).expanduser()
+    args.checkpoint_path = checkpoints_dir / f"checkpoint_{args.checkpoint_step}"
+    return args
 
 
 def extract_basic_metrics(results: Mapping[str, Mapping[str, float]]) -> dict[str, float]:
@@ -45,80 +76,15 @@ def print_results(results: Mapping[str, dict]) -> None:
         print("\nAggregated metrics not provided for this run.")
 
 
-def parse_train_layers(raw: str) -> tuple[int, ...]:
-    values = tuple(int(tok) for tok in raw.split(",") if tok.strip())
-    if not values:
-        raise ValueError("--train-layers requires at least one integer index")
-    return values
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a quantized checkpoint via lm_eval.")
-    parser.add_argument(
-        "--checkpoints-dir",
-        type=str,
-        default=str(DEFAULT_CHECKPOINTS_DIR),
-        help="Directory containing checkpoint files (step_<n>.pt).",
-    )
-    parser.add_argument(
-        "--checkpoint-step",
-        type=int,
-        default=1000,
-        help="Training step whose checkpoint should be evaluated.",
-    )
-    parser.add_argument(
-        "--train-layers",
-        type=str,
-        required=True,
-        help="Comma-separated decoder layer indices that were quantized (e.g. 0,1,2).",
-    )
-    parser.add_argument("--batch-size", type=int, default=Config.batch_size)
-    parser.add_argument("--seq-len", type=int, default=Config.seq_len)
-    parser.add_argument("--device", type=str, default=Config.device)
-    parser.add_argument("--dtype", type=str, default=Config.dtype)
-    parser.add_argument(
-        "--tasks",
-        type=str,
-        nargs="+",
-        default=["gsm8k"],
-        help="Whitespace-separated lm_eval task names.",
-    )
-    parser.add_argument("--num-fewshot", type=int, default=5)
-    parser.add_argument("--limit", type=float, default=0.05, help="Optional fraction per task (e.g., 0.01).")
-    parser.add_argument("--output", type=str, default="eval_results.json")
-    args = parser.parse_args()
-    args.train_layers = parse_train_layers(args.train_layers)
-    checkpoints_dir = Path(args.checkpoints_dir).expanduser()
-    args.checkpoint_path = checkpoints_dir / f"step_{args.checkpoint_step}.pt"
-    return args
-
-
-def load_teacher(args: argparse.Namespace):
-    device = torch.device(args.device)
-    dtype = getattr(torch, args.dtype)
-    resolved = resolve_model_path(Config.base_path)
-    return load_model(resolved, device, dtype)
-
-
-def load_student(args: argparse.Namespace, teacher: torch.nn.Module):
-    model = copy.deepcopy(teacher)
-    print("  Preparing quantized student...")
-    prepare_quant_layers(
-        model.model,
-        args.train_layers,
-        set_scales=False,
-    )
-    print("  Loading checkpoint...")
-    load_checkpoint(str(args.checkpoint_path), model, map_location=args.device)
-    return model
-
-
 def main():
     args = parse_args()
+    device = torch.device(args.device)
+    dtype = getattr(torch, args.dtype)
+
     print("Loading teacher...")
-    teacher = load_teacher(args)
+    teacher = load_model(args.base_path, device, dtype)
     print("Loading student...")
-    student = load_student(args, teacher)
+    student = load_custom_model(args.checkpoint_path, device, dtype)
 
     with torch.no_grad():
         print("Evaluating teacher...")

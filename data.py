@@ -66,8 +66,6 @@ def build_dataloader(
             split="train",
             streaming=True,
         )
-        if world_size > 1:
-            ds = ds.shard(num_shards=world_size, index=rank)
         if label == "RL":
             ds = ds.filter(lambda ex: bool(ex.get("outputs")))
         remove_columns = None
@@ -108,6 +106,25 @@ def build_dataloader(
         seed=seed,
         stopping_strategy="first_exhausted",
     )
+
+    def split_for_rank(stream, *, world_size: int, rank: int):
+        if world_size <= 1:
+            return stream
+        try:
+            from datasets.distributed import split_dataset_by_node  # type: ignore
+
+            return split_dataset_by_node(stream, world_size=world_size, rank=rank)
+        except Exception:
+            pass
+
+        # Fallback for older versions (or streaming edge-cases): deterministic modulo sharding.
+        # This avoids relying on underlying data source counts.
+        stream = stream.enumerate()
+        stream = stream.filter(lambda ex: (ex["idx"] % world_size) == rank)
+        stream = stream.map(lambda ex: {k: v for k, v in ex.items() if k != "idx"})
+        return stream
+
+    stream = split_for_rank(stream, world_size=world_size, rank=rank)
     stream = stream.shuffle(buffer_size=cfg.shuffle_buffer_size, seed=seed)
     stream = stream.with_format("torch")
 

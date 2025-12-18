@@ -33,19 +33,16 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 DIR = Path(__file__).resolve().parent
-
 CHOSEN_ACTIVATION = IdentityActivation
-# GATE_UP_QUANTIZER = QuantLinearWithScales
-# DOWN_QUANTIZER = QuantLinearWithScales
-GATE_UP_QUANTIZER = QuantLinearWithWeights
-DOWN_QUANTIZER = QuantLinearWithWeights
+GATE_UP_QUANTIZER = QuantLinearWithScales
+DOWN_QUANTIZER = QuantLinearWithScales
 
 @dataclass
 class Config:
-    batch_size: int = 6
+    batch_size: int = 8
     seq_len: int = 1024
-    accumulate_steps: int = 8
-    lr: float = 8e-5
+    accumulate_steps: int = 2
+    lr: float = 1e-3
     device: str = "cuda"
     dtype: str = "bfloat16"
     base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
@@ -53,19 +50,19 @@ class Config:
     dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
     dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
     dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
-    dataset_ratio_sft: float = 0.8
-    dataset_ratio_dpo: float = 0.1
-    dataset_ratio_rl: float = 0.1
-    shuffle_buffer_size: int = 10000
+    dataset_ratio_sft: float = 0.6
+    dataset_ratio_dpo: float = 0.2
+    dataset_ratio_rl: float = 0.2
+    shuffle_buffer_size: int = 10
     seed: int = 42
     num_workers: int = 1
     compile: bool = True
-    blend_steps: int = 20
+    blend_steps: int = 10
     kl_threshold: float = 0.1
-    hidden_mse_weight: float = 2.0
+    hidden_mse_weight: float = 1.0
     kl_weight: float = 1.0
-    weight_decay: float = 0.05
-    act_fn_lr_mult: float = 5.0
+    weight_decay: float = 0.01
+    act_fn_lr_mult: float = 10.0
     log_act_s_lr_mult: float = 20.0
     log_diag_s_lr_mult: float = 10.0
     log_weight_s_lr_mult: float = 1.0
@@ -135,6 +132,7 @@ def prepare_layers(
 
             for name in [f"{prefix}_proj" for prefix in group_name.split("_")]:
                 linear_to_replace = getattr(parent_module, name)
+                diag_path = diag_scaling_path(layer_index, name)
                 linear = quantizer(
                     linear_to_replace.in_features,
                     linear_to_replace.out_features,
@@ -149,7 +147,6 @@ def prepare_layers(
                 layer_param_groups.append({"params": [linear.log_act_s], "lr": lr * log_act_s_lr_mult, "lr_mult": log_act_s_lr_mult})
 
                 if quantizer == QuantLinearWithScales:
-                    diag_path = diag_scaling_path(layer_index, name)
                     if not diag_path.exists():
                         raise FileNotFoundError(f"Missing diag scaling file: {diag_path}")
                     payload = torch.load(diag_path, map_location="cpu")
@@ -170,16 +167,16 @@ def prepare_layers(
     return act_fns, layer_param_groups
 
 
-def maybe_update_lr_or_checkpoint(
+def maybe_update_lr_or_exit(
     cfg,
     *,
     distributed: bool,
     device: torch.device,
     rank: int,
 ) -> bool:
-    """Non-blocking stdin poll to update base LR or request checkpoint; broadcasts in DDP."""
+    """Non-blocking stdin poll to update base LR or request exit; broadcasts in DDP."""
     new_base_lr: float | None = None
-    checkpoint_requested = False
+    exit_requested = False
     if rank == 0:
         try:
             readable, _, _ = select.select([sys.stdin], [], [], 0)
@@ -189,8 +186,8 @@ def maybe_update_lr_or_checkpoint(
             line = sys.stdin.readline()
             if line:
                 stripped = line.strip().lower()
-                if stripped == "checkpoint":
-                    checkpoint_requested = True
+                if stripped == "exit":
+                    exit_requested = True
                 else:
                     try:
                         candidate = float(stripped)
@@ -199,16 +196,13 @@ def maybe_update_lr_or_checkpoint(
                         else:
                             new_base_lr = candidate
                     except ValueError:
-                        print(
-                            f"[lr] invalid input: '{stripped}' (enter float lr or 'checkpoint')",
-                            flush=True,
-                        )
+                        print(f"[lr] invalid input: '{stripped}' (enter float lr or 'exit')", flush=True)
     # broadcast candidate lr and exit flag so all ranks stay in sync
     if distributed:
         tensor = torch.tensor(
             [
                 new_base_lr if new_base_lr is not None else -1.0,
-                1.0 if checkpoint_requested else 0.0,
+                1.0 if exit_requested else 0.0,
             ],
             device=device,
         )
@@ -219,43 +213,12 @@ def maybe_update_lr_or_checkpoint(
             new_base_lr = broadcasted_lr
         else:
             new_base_lr = None
-        checkpoint_requested = broadcasted_exit
+        exit_requested = broadcasted_exit
     if new_base_lr is not None:
         cfg.lr = new_base_lr
         if rank == 0:
             print(f"[lr] updated base lr to {new_base_lr:.2e}", flush=True)
-    return checkpoint_requested
-
-
-def save_checkpoint(model, cfg, step: int, rank: int, distributed: bool):
-    """Save model checkpoint from rank 0; sync if distributed."""
-    if distributed:
-        dist.barrier()
-    if rank == 0:
-        try:
-            output_dir = Path(cfg.output_dir).expanduser() / f"step-{step}"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            model_to_save = model
-            while hasattr(model_to_save, "module"):
-                model_to_save = model_to_save.module
-            while hasattr(model_to_save, "_orig_mod"):
-                model_to_save = model_to_save._orig_mod
-            try:
-                model_to_save.save_pretrained(str(output_dir))
-            except Exception:
-                model_to_save.save_pretrained(str(output_dir), safe_serialization=False)
-            torch.save(
-                {
-                    "cfg": asdict(cfg),
-                    "steps": step,
-                },
-                output_dir / "trainer_state.pt",
-            )
-            print(f"[ckpt] checkpoint saved at step {step} -> {output_dir}", flush=True)
-        except Exception as e:
-            print(f"[ckpt] failed to save at step {step} to {output_dir}: {e}", flush=True)
-    if distributed:
-        dist.barrier()
+    return exit_requested
 
 
 def main() -> None:
@@ -323,7 +286,6 @@ def main() -> None:
             device_ids=[local_rank],
             output_device=local_rank,
         )
-    student_base = student.module if hasattr(student, "module") else student
     optimizer = torch.optim.AdamW(layer_param_groups, weight_decay=cfg.weight_decay)
 
     last_mse: torch.Tensor = torch.tensor(0.0, device=device, dtype=dtype)
@@ -337,7 +299,7 @@ def main() -> None:
         for group in optimizer.param_groups:
             group["lr"] = lr * float(group.get("lr_mult", 1.0))
 
-    num_layers = len(student_base.model.layers)
+    num_layers = len(student.model.layers)
     total_blend_units = num_layers * cfg.blend_steps
     progress = tqdm(
         total=total_blend_units,
@@ -374,16 +336,16 @@ def main() -> None:
         while True:
             step += 1
 
-            checkpoint_requested = maybe_update_lr_or_checkpoint(
+            exit_requested = maybe_update_lr_or_exit(
                 cfg,
                 distributed=distributed,
                 device=device,
                 rank=rank,
             )
-            if checkpoint_requested:
-                save_checkpoint(student, cfg, step, rank, distributed)
+            if exit_requested:
+                break
 
-            current_lr = cfg.lr
+            current_lr = cfg.lr * ema_kl
             set_layer_lrs(current_lr)
 
             blend_val = (
@@ -485,6 +447,30 @@ def main() -> None:
     finally:
         for h in teacher_hooks + student_hooks:
             h.remove()
+
+    if distributed:
+        dist.barrier()
+
+    if rank == 0:
+        output_dir = Path(cfg.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        model_to_save = student
+        if hasattr(model_to_save, "module"):
+            model_to_save = model_to_save.module
+        while hasattr(model_to_save, "_orig_mod"):
+            model_to_save = model_to_save._orig_mod
+        model_to_save.save_pretrained(str(output_dir))
+        torch.save(
+            {
+                "cfg": asdict(cfg),
+                "steps": step,
+            },
+            output_dir / "trainer_state.pt",
+        )
+
+    if distributed:
+        dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,41 @@
+
+goal is to test basic identity activation with our best quantizer to give it the best chance. 
+wow, this might work. we're at 0.7 with threshold 0.1 (of course to let it train after reaching 1.0).
+by step 300 we're at 1.0. KL~1.5. now we pray KL comes down.
+332, we see our first dip below 0.1.
+
+step 380 and it diverged. I guess we shouldn't tie KL
+
+DIR = Path(__file__).resolve().parent
+CHOSEN_ACTIVATION = IdentityActivation
+GATE_UP_QUANTIZER = QuantLinearWithScales
+DOWN_QUANTIZER = QuantLinearWithScales
+
+@dataclass
+class Config:
+    batch_size: int = 6
+    seq_len: int = 1024
+    accumulate_steps: int = 8
+    lr: float = 8e-4
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR.parent / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.6
+    dataset_ratio_dpo: float = 0.2
+    dataset_ratio_rl: float = 0.2
+    shuffle_buffer_size: int = 1000
+    seed: int = 42
+    num_workers: int = 1
+    compile: bool = True
+    blend_steps: int = 20
+    kl_threshold: float = 0.1
+    hidden_mse_weight: float = 1.0
+    kl_weight: float = 1.0
+    weight_decay: float = 0.05
+    act_fn_lr_mult: float = 5.0
+    log_act_s_lr_mult: float = 20.0
+    log_diag_s_lr_mult: float = 10.0
+    log_weight_s_lr_mult: float = 1.0

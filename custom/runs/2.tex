@@ -1,0 +1,108 @@
+if we get product as we wan't, we won't do quantization until later, because we'll work instead in convolution domain.
+so first just try to get product alone running. modified main for this, and increased batch size 8x. 6*8*64=3k, so we don't see KL bounce around. 
+also halved starting LR. Letting it run for 40 mins while I eat. 
+
+
+CHOSEN_ACTIVATION = IdentityActivation
+# GATE_UP_QUANTIZER = QuantLinearWithScales
+# DOWN_QUANTIZER = QuantLinearWithScales
+# GATE_UP_QUANTIZER = QuantLinearWithWeights
+# DOWN_QUANTIZER = QuantLinearWithWeights
+
+@dataclass
+class Config:
+    batch_size: int = 6
+    seq_len: int = 1024
+    accumulate_steps: int = 64
+    lr: float = 4e-5
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR.parent / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.8
+    dataset_ratio_dpo: float = 0.1
+    dataset_ratio_rl: float = 0.1
+    shuffle_buffer_size: int = 10000
+    seed: int = 42
+    num_workers: int = 1
+    compile: bool = True
+    blend_steps: int = 20
+    kl_threshold: float = 0.08
+    hidden_mse_weight: float = 4.0
+    kl_weight: float = 1.0
+    weight_decay: float = 0.05
+    act_fn_lr_mult: float = 5.0
+    log_act_s_lr_mult: float = 20.0
+    log_diag_s_lr_mult: float = 10.0
+    log_weight_s_lr_mult: float = 1.0
+
+Wow, that failed. Bringing down shuffle buffer again to 1k.
+Let's figure out why. First we raise LR to 1e-3, and return threshold to 0.1.
+But maybe this is an indication that we simply can't reach blend 1 with KL below 0.1. 
+So actually I'm going to train first with small batch size 8*6*2=96, try to get to blend 1 at 0.1, and if this works save it then go for larger batch size and smaller LR.
+If it fails, I won't pursue identity activation anymore. 
+Ah, it's not doing well, but recall we observed smaller max values when quantizing. That quantization leans away from large values, and that's indirectly helpful for identity activation. 
+So now I'm trying as below with plans to immediately lower LR 
+(Actually I tried first with accum 4 and lr 8e-4 but by step 90 still at 0.1 blend, so I'll go back to what we had in (1) except LR 1e-3 to start)
+Fuck, not working, so I'll try to reproduce what we did in (1). Copied the config, all should be the same. 
+Only diffs are 10x shuffle buffer and 8e-4 LR. I'd be surprised if either makes a difference. 
+Just wait for step 330 and see if we're at blend 0.75 like before. 
+that means waiting 11.81 * 300 / 60 ~ an hour
+wow, it is indeed doing better, maybe shuffle buffer really matters. 
+At step 30 already at .3 blend. 
+And we reached .75 blend at step only 220. 
+Ok finally reached blend 1, this time at 408 (last time 490 ish). 
+
+
+CHOSEN_ACTIVATION = IdentityActivation
+# GATE_UP_QUANTIZER = QuantLinearWithScales
+# DOWN_QUANTIZER = QuantLinearWithScales
+GATE_UP_QUANTIZER = QuantLinearWithWeights
+DOWN_QUANTIZER = QuantLinearWithWeights
+
+@dataclass
+class Config:
+    batch_size: int = 6
+    seq_len: int = 1024
+    accumulate_steps: int = 8
+    lr: float = 1e-3
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR.parent / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.8
+    dataset_ratio_dpo: float = 0.1
+    dataset_ratio_rl: float = 0.1
+    shuffle_buffer_size: int = 1000
+    seed: int = 42
+    num_workers: int = 1
+    compile: bool = True
+    blend_steps: int = 20
+    kl_threshold: float = 0.1
+    hidden_mse_weight: float = 1.0
+    kl_weight: float = 1.0
+    weight_decay: float = 0.05
+    act_fn_lr_mult: float = 5.0
+    log_act_s_lr_mult: float = 20.0
+    log_diag_s_lr_mult: float = 10.0
+    log_weight_s_lr_mult: float = 1.0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
