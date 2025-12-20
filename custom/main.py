@@ -27,7 +27,7 @@ from ..utils import (
     resolve_model_path,
     argmax_stability_metrics
 )
-from .activation import PiecewiseActivation, IdentityActivation, LeakyActivation, OffsetReluActivation, SiluActivation
+from .activation import PiecewiseActivation, IdentityWithBlendActivation, LeakyActivation, OffsetReluActivation, SiluActivation
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True

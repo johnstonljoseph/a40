@@ -23,6 +23,13 @@ python -m a40.eval --checkpoint-step 1000 --train-layers 0,1,2,3,4,5,6,7,8,9,10,
 
 python -m a40.eval --checkpoint-name "r2-408" --eval-include-teacher
 
+python -m a40.eval \
+  --checkpoint-name r2-408 \
+  --include-teacher \
+  --limit 0.01 \
+  --tasks gsm8k mmlu hellaswag arc_challenge winogrande humaneval mbpp \
+  --output eval_results_r2-408-core.json
+
 
 # upload
 rclone copy a40/checkpoints/student_final/r5-62/ \
@@ -32,3 +39,5 @@ rclone copy a40/checkpoints/student_final/r5-62/ \
 
 # download
 rclone copy gdrive:checkpoints/r8-111 /workspace/a40/checkpoints/r5-62 --progress
+
+

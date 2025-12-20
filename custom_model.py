@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from a40.quant import QuantLinearWithWeights
-from a40.custom.activation import IdentityActivation, PiecewiseActivation, OffsetReluActivation
+from a40.custom.activation import IdentityWithBlendActivation, IdentityActivation, PiecewiseActivation, OffsetReluActivation
 
 
 class MyOlmo3Config(Olmo3Config):
@@ -24,10 +24,14 @@ class MyOlmo3ForCausalLM(Olmo3ForCausalLM):
 
         for layer in self.model.layers:
             mlp = layer.mlp
-            mlp.act_fn = PiecewiseActivation().to(
-                device=mlp.gate_proj.weight.device,
-                dtype=mlp.gate_proj.weight.dtype,
-            )
+            weight_device = mlp.gate_proj.weight.device
+            weight_dtype = mlp.gate_proj.weight.dtype
+            act_fn = IdentityActivation()
+            if weight_device.type == "meta":
+                act_fn = act_fn.to(dtype=weight_dtype)
+            else:
+                act_fn = act_fn.to(device=weight_device, dtype=weight_dtype)
+            mlp.act_fn = act_fn
             names = ["gate_proj", "up_proj", "down_proj"]
             for name in names:
                 linear_to_replace = getattr(mlp, name)
@@ -36,7 +40,12 @@ class MyOlmo3ForCausalLM(Olmo3ForCausalLM):
                     linear_to_replace.out_features,
                 )
                 setattr(mlp, name, linear)
-                linear.to(linear_to_replace.weight.device)
+                target_device = linear_to_replace.weight.device
+                target_dtype = linear_to_replace.weight.dtype
+                if target_device.type == "meta":
+                    linear.to(dtype=target_dtype)
+                else:
+                    linear.to(device=target_device, dtype=target_dtype)
 
 
 class MyOlmo3MLP(nn.Module):

@@ -27,13 +27,13 @@ from ..utils import (
     resolve_model_path,
     argmax_stability_metrics
 )
-from .activation import PiecewiseActivation, IdentityActivation
+from .activation import PiecewiseActivation, IdentityWithBlendActivation
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 DIR = Path(__file__).resolve().parent
-CHOSEN_ACTIVATION = IdentityActivation
+CHOSEN_ACTIVATION = IdentityWithBlendActivation
 GATE_UP_QUANTIZER = QuantLinearWithScales
 DOWN_QUANTIZER = QuantLinearWithScales
 

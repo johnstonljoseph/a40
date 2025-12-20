@@ -53,7 +53,23 @@ class SiluActivation(nn.Module):
 
 # Id
 
-class _IdActivationFn(Function):
+class IdentityActivation(nn.Module):
+    """Blend between SiLU (0.0) and learnable piecewise linear (1.0)."""
+    def __init__(
+        self,
+    ) -> None:
+        super().__init__()
+        # Non-persistent so checkpoints cannot override runtime-enforced blend.
+        self.register_buffer("_blend", torch.tensor(0.0), persistent=False)
+
+    def set_blend(self, value: float) -> None:
+        self._blend.data.fill_(float(value))
+
+    def forward(self, gate: torch.Tensor) -> torch.Tensor:
+        return gate
+
+
+class _IdActivationWithBlendFn(Function):
     @staticmethod
     def forward(
         ctx,
@@ -83,7 +99,7 @@ class _IdActivationFn(Function):
         return None, grad_gate
 
 
-class IdentityActivation(nn.Module):
+class IdentityWithBlendActivation(nn.Module):
     """Blend between SiLU (0.0) and learnable piecewise linear (1.0)."""
     def __init__(
         self,
@@ -98,7 +114,7 @@ class IdentityActivation(nn.Module):
     def forward(self, gate: torch.Tensor) -> torch.Tensor:
         gate = gate.to(self._blend.dtype)
         blend = self._blend.to(gate.dtype)
-        return _IdActivationFn.apply(blend, gate)
+        return _IdActivationWithBlendFn.apply(blend, gate)
 
 
 # Piecewise
