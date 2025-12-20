@@ -11,8 +11,6 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.autograd import Function
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm.auto import tqdm
 from transformers.models.olmo3 import Olmo3Model, Olmo3ForCausalLM
@@ -27,8 +25,6 @@ from ..utils import (
     resolve_model_path,
     argmax_stability_metrics
 )
-from .activation import PiecewiseActivation, IdentityActivation
-
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -36,10 +32,10 @@ DIR = Path(__file__).resolve().parent
 
 @dataclass
 class Config:
-    batch_size: int = 6
+    batch_size: int = 8
     seq_len: int = 1024
-    accumulate_steps: int = 8
-    lr: float = 8e-5
+    accumulate_steps: int = 16
+    lr: float = 2e-6
     device: str = "cuda"
     dtype: str = "bfloat16"
     base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
@@ -50,16 +46,16 @@ class Config:
     dataset_ratio_sft: float = 0.6
     dataset_ratio_dpo: float = 0.2
     dataset_ratio_rl: float = 0.2
-    shuffle_buffer_size: int = 10
+    shuffle_buffer_size: int = 10000
     seed: int = 43
     num_workers: int = 1
     compile: bool = True
-    kl_threshold: float = 0.1
-    hidden_mse_weight: float = 2.0
     kl_weight: float = 1.0
     weight_decay: float = 0.05
-    log_act_s_lr_mult: float = 20.0
+    log_act_s_lr_mult: float = 10.0
     log_weight_s_lr_mult: float = 1.0
+    vocab_bias_lr_mult: float = 1.0
+    down_proj_bias_lr_mult: float = 1.0
 
 
 def weight_calib_path(layer_index: int, name: str):
@@ -72,13 +68,11 @@ def prepare_layers(
     lr: float,
     log_act_s_lr_mult: float,
     log_weight_s_lr_mult: float,
+    vocab_bias_lr_mult: float,
+    down_proj_bias_lr_mult: float,
 ) -> list[dict]:
     layer_param_groups: list[dict] = []
     for layer_index, layer in enumerate(model.model.layers):
-        norm = getattr(layer, "post_feedforward_layernorm")
-        norm_params = [getattr(norm, "weight")]
-        layer_param_groups.append({"params": norm_params, "lr": lr, "lr_mult": 1.0})
-
         mlp = layer.mlp
         names = ["gate_proj", "up_proj", "down_proj"]
         for name in names:
@@ -86,9 +80,34 @@ def prepare_layers(
             linear.set_trainable(True)
 
             layer_param_groups.append({"params": [linear.weight], "lr": lr, "lr_mult": 1.0})
-            layer_param_groups.append({"params": [linear.log_act_s], "lr": lr * log_act_s_lr_mult, "lr_mult": log_act_s_lr_mult})
-            layer_param_groups.append({"params": [linear.log_weight_s], "lr": lr * log_weight_s_lr_mult, "lr_mult": log_weight_s_lr_mult})
+            layer_param_groups.append(
+                {"params": [linear.log_act_s], "lr": lr * log_act_s_lr_mult, "lr_mult": log_act_s_lr_mult}
+            )
+            layer_param_groups.append(
+                {"params": [linear.log_weight_s], "lr": lr * log_weight_s_lr_mult, "lr_mult": log_weight_s_lr_mult}
+            )
+            if getattr(linear, "bias", None) is not None:
+                layer_param_groups.append(
+                    {
+                        "params": [linear.bias],
+                        "lr": lr * down_proj_bias_lr_mult,
+                        "lr_mult": down_proj_bias_lr_mult,
+                        "weight_decay": 0.0,
+                    }
+                )
             linear.q_name = f"layer{layer_index}.{mlp.__class__.__name__}.{name}"
+
+    head_bias = getattr(model.lm_head, "bias", None)
+    if head_bias is not None:
+        head_bias.requires_grad_(True)
+        layer_param_groups.append(
+            {
+                "params": [head_bias],
+                "lr": lr * vocab_bias_lr_mult,
+                "lr_mult": vocab_bias_lr_mult,
+                "weight_decay": 0.0,
+            }
+        )
 
     return layer_param_groups
 
@@ -217,12 +236,86 @@ def main() -> None:
     if rank == 0:
         print("[run] loading student checkpoint...", flush=True)
     student = load_model("/workspace/a40/checkpoints/r2-408", device, dtype)
+    student_base = student  # may be wrapped later; keep reference for bias checks
     layer_param_groups = prepare_layers(
         student,
         cfg.lr,
         cfg.log_act_s_lr_mult,
         cfg.log_weight_s_lr_mult,
+        cfg.vocab_bias_lr_mult,
+        cfg.down_proj_bias_lr_mult,
     )
+
+    def _zero_nonfinite_biases(student_base, *, tag: str):
+        cleaned: list[str] = []
+        head_bias = getattr(student_base.lm_head, "bias", None)
+        if head_bias is not None:
+            before = head_bias.clone()
+            head_bias.data.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+            if not torch.equal(before, head_bias):
+                cleaned.append("lm_head.bias")
+        for i, layer in enumerate(student_base.model.layers):
+            b = getattr(layer.mlp, "down_proj").bias
+            if b is None:
+                continue
+            before = b.clone()
+            b.data.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+            if not torch.equal(before, b):
+                cleaned.append(f"layer{i}.down_proj.bias")
+        if cleaned and rank == 0:
+            print(f"[bias] zeroed nonfinite biases ({tag}):", cleaned, flush=True)
+
+    def _maybe_describe_bias_opt(student_base, optimizer):
+        if os.environ.get("BIAS_CHECK", "0") != "1" or rank != 0:
+            return
+        head_bias = getattr(student_base.lm_head, "bias", None)
+        target_params = {"lm_head.bias": head_bias}
+        for i, layer in enumerate(student_base.model.layers):
+            target_params[f"layer_{i}.down_proj.bias"] = getattr(layer.mlp, "down_proj").bias
+
+        print("[bias] lr/weight_decay for bias params:", flush=True)
+        for name, param in target_params.items():
+            found = False
+            for group in optimizer.param_groups:
+                if any(param is p for p in group["params"]):
+                    print(
+                        f"  {name}: lr={group['lr']:.3e}, wd={group.get('weight_decay', 0.0)}",
+                        flush=True,
+                    )
+                    found = True
+                    break
+            if not found:
+                print(f"  {name}: NOT in optimizer", flush=True)
+
+    def _maybe_log_bias_grads(student_base, step):
+        if os.environ.get("BIAS_CHECK", "0") != "1" or rank != 0:
+            return
+        with torch.no_grad():
+            head_bias = getattr(student_base.lm_head, "bias", None)
+            head_grad = None if head_bias is None else head_bias.grad
+            h_norm = None if head_grad is None else head_grad.norm().item()
+            print(f"[bias_grad] step={step} lm_head.bias grad_norm={h_norm}", flush=True)
+            # Log a few layers to avoid huge prints.
+            for i, layer in enumerate(student_base.model.layers[:4]):
+                b = getattr(layer.mlp, "down_proj").bias
+                g = None if b is None else b.grad
+                g_norm = None if g is None else g.norm().item()
+                g_max = None if g is None else g.abs().max().item()
+                b_norm = None if b is None else b.norm().item()
+                req = None if b is None else b.requires_grad
+                if b is not None and not torch.isfinite(b).all():
+                    b.data.zero_()
+                    print(f"[bias_grad] step={step} layer{i}.down_proj.bias had nonfinite values -> zeroed", flush=True)
+                if g is not None and not torch.isfinite(g).all():
+                    b.grad.zero_()
+                    g_norm = 0.0
+                    g_max = 0.0
+                    print(f"[bias_grad] step={step} layer{i}.down_proj.bias had nonfinite grad -> zeroed", flush=True)
+                print(
+                    f"[bias_grad] step={step} layer{i}.down_proj.bias "
+                    f"req_grad={req} param_norm={b_norm} grad_norm={g_norm} grad_max={g_max}",
+                    flush=True,
+                )
 
     def teacher_infer(input_ids, attention_mask):
         with torch.inference_mode():
@@ -245,20 +338,19 @@ def main() -> None:
             output_device=local_rank,
         )
     student_base = student.module if hasattr(student, "module") else student
+    _zero_nonfinite_biases(student_base, tag="startup")
     optimizer = torch.optim.AdamW(layer_param_groups, weight_decay=cfg.weight_decay)
+    _maybe_describe_bias_opt(student_base, optimizer)
 
-    last_mse: torch.Tensor = torch.tensor(0.0, device=device, dtype=dtype)
     last_kl: torch.Tensor = torch.tensor(0.0, device=device, dtype=dtype)
     last_top1: float = 0.0
     last_flip: float = 0.0
     ema_kl: float = 0.0
-    ema_mse: float = 0.0
 
     def set_layer_lrs(lr: float) -> None:
         for group in optimizer.param_groups:
             group["lr"] = lr * float(group.get("lr_mult", 1.0))
 
-    num_layers = len(student_base.model.layers)
     progress = tqdm(
         total=None,
         desc="distill",
@@ -270,118 +362,85 @@ def main() -> None:
         build_dataloader(cfg, base_path, seed=cfg.seed, world_size=world_size, rank=rank)
     )
 
-    teacher_acts: list[torch.Tensor | None] = [None] * num_layers
-    student_acts: list[torch.Tensor | None] = [None] * num_layers
+    while True:
+        step += 1
 
-    def attach_all_post_ff_hooks(model: Olmo3Model, acts: dict[str, torch.Tensor], detach: bool):
-        handles = []
-        for idx in range(num_layers):
-            ln = getattr(model.layers[idx], "post_feedforward_layernorm")
+        checkpoint_requested = maybe_update_lr_or_checkpoint(
+            cfg,
+            distributed=distributed,
+            device=device,
+            rank=rank,
+        )
+        if checkpoint_requested:
+            save_checkpoint(student, cfg, step, rank, distributed)
 
-            def hook(_module, _inp, output, idx=idx):
-                acts[idx] = output.detach() if detach else output
+        current_lr = cfg.lr
+        set_layer_lrs(current_lr)
 
-            handles.append(ln.register_forward_hook(hook))
-        return handles
+        optimizer.zero_grad(set_to_none=True)
 
-    teacher_hooks = attach_all_post_ff_hooks(teacher.model, teacher_acts, detach=True)
-    student_base = student.module if hasattr(student, "module") else student
-    student_hooks = attach_all_post_ff_hooks(student_base.model, student_acts, detach=False)
+        for micro_step in range(cfg.accumulate_steps):
+            sync = micro_step == (cfg.accumulate_steps - 1)
+            sync_ctx = nullcontext()
+            if distributed and not sync:
+                sync_ctx = student.no_sync()
 
-    try:
-        while True:
-            step += 1
-
-            checkpoint_requested = maybe_update_lr_or_checkpoint(
-                cfg,
-                distributed=distributed,
-                device=device,
-                rank=rank,
-            )
-            if checkpoint_requested:
-                save_checkpoint(student, cfg, step, rank, distributed)
-
-            current_lr = cfg.lr
-            set_layer_lrs(current_lr)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            for micro_step in range(cfg.accumulate_steps):
-                sync = micro_step == (cfg.accumulate_steps - 1)
-                sync_ctx = nullcontext()
-                if distributed and not sync:
-                    sync_ctx = student.no_sync()
-
-                try:
-                    batch = next(batch_iter)
-                except StopIteration:
-                    batch_iter = iter(
-                        build_dataloader(
-                            cfg,
-                            base_path,
-                            seed=cfg.seed + step,
-                            world_size=world_size,
-                            rank=rank,
-                        )
+            try:
+                batch = next(batch_iter)
+            except StopIteration:
+                batch_iter = iter(
+                    build_dataloader(
+                        cfg,
+                        base_path,
+                        seed=cfg.seed + step,
+                        world_size=world_size,
+                        rank=rank,
                     )
-                    batch = next(batch_iter)
-
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-
-                with sync_ctx:
-                    student_logits = student(input_ids=input_ids, attention_mask=attention_mask).logits
-                    teacher_logits = teacher_infer(input_ids=input_ids, attention_mask=attention_mask).logits
-
-                    mask = attention_mask.to(student_logits.dtype).unsqueeze(-1)
-                    mse_accum = 0.0
-                    for idx in range(num_layers):
-                        s_act = student_acts[idx]
-                        t_act = teacher_acts[idx]
-                        if s_act is None or t_act is None:
-                            raise RuntimeError(f"Missing activations for layer {idx}")
-                        diff = s_act - t_act
-                        mse_accum = mse_accum + (diff.pow(2) * mask).sum() / (mask.sum() * diff.shape[-1])
-                    mse_loss = mse_accum / num_layers
-
-                    kl_loss = compute_kl_loss(student_logits, teacher_logits, attention_mask)
-                    top1_acc, flip_pen = argmax_stability_metrics(teacher_logits, student_logits, attention_mask)
-                    loss = (cfg.hidden_mse_weight * mse_loss + cfg.kl_weight * kl_loss) / cfg.accumulate_steps
-                    loss.backward()
-
-                    last_mse = mse_loss.detach()
-                    last_kl = kl_loss.detach()
-                    last_top1 = top1_acc
-                    last_flip = flip_pen
-
-                    del student_logits, teacher_logits, loss
-
-            optimizer.step()
-
-            kl_val = float(last_kl.item())
-            mse_val = float(last_mse.item())
-            if distributed:
-                kl_tensor = torch.tensor([kl_val], device=device)
-                dist.all_reduce(kl_tensor, op=dist.ReduceOp.SUM)
-                kl_val = kl_tensor.item() / world_size
-            ema_kl = 0.6 * ema_kl + 0.4 * kl_val
-            ema_mse = 0.6 * ema_mse + 0.4 * mse_val
-
-            if rank == 0:
-                progress.set_postfix(
-                    {
-                        "kl": f"{kl_val:.4f}",
-                        "ema_kl": f"{ema_kl:.4f}",
-                        "ema_mse": f"{ema_mse:.4f}",
-                        "base_lr": f"{current_lr:.2e}",
-                        "step": f"{step}",
-                        "top1": f"{last_top1:.3f}",
-                        "flip": f"{last_flip:.3f}",
-                    }
                 )
-    finally:
-        for h in teacher_hooks + student_hooks:
-            h.remove()
+                batch = next(batch_iter)
+
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            with sync_ctx:
+                student_logits = student(input_ids=input_ids, attention_mask=attention_mask).logits
+                teacher_logits = teacher_infer(input_ids=input_ids, attention_mask=attention_mask).logits
+
+                kl_loss = compute_kl_loss(student_logits, teacher_logits, attention_mask)
+                top1_acc, flip_pen = argmax_stability_metrics(teacher_logits, student_logits, attention_mask)
+                loss = (cfg.kl_weight * kl_loss) / cfg.accumulate_steps
+                loss.backward()
+
+                last_kl = kl_loss.detach()
+                last_top1 = top1_acc
+                last_flip = flip_pen
+
+                del student_logits, teacher_logits, loss
+
+        _maybe_log_bias_grads(student_base, step)
+
+        torch.nn.utils.clip_grad_norm_(student_base.parameters(), max_norm=1.0)
+        optimizer.step()
+        _zero_nonfinite_biases(student_base, tag="post_step")
+
+        kl_val = float(last_kl.item())
+        if distributed:
+            kl_tensor = torch.tensor([kl_val], device=device)
+            dist.all_reduce(kl_tensor, op=dist.ReduceOp.SUM)
+            kl_val = kl_tensor.item() / world_size
+        ema_kl = 0.6 * ema_kl + 0.4 * kl_val
+
+        if rank == 0:
+            progress.set_postfix(
+                {
+                    "kl": f"{kl_val:.4f}",
+                    "ema_kl": f"{ema_kl:.4f}",
+                    "base_lr": f"{current_lr:.2e}",
+                    "step": f"{step}",
+                    "top1": f"{last_top1:.3f}",
+                    "flip": f"{last_flip:.3f}",
+                }
+            )
 
 if __name__ == "__main__":
     main()

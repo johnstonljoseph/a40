@@ -1,0 +1,161 @@
+try piecewise but initialized with positive left sloe like we found them, but now also with different offsets, to see if the leanred params are same as before or close to their initialization. 
+blend is 10 steps with 0.1 threshold, expected case it finishes and just stays there.
+so i should try again with no blending, and maybe not changing offsets so we still pass through zero at zero. 
+
+
+CHOSEN_ACTIVATION = PiecewiseActivation
+# GATE_UP_QUANTIZER = QuantLinearWithScales
+# DOWN_QUANTIZER = QuantLinearWithScales
+GATE_UP_QUANTIZER = QuantLinearWithWeights
+DOWN_QUANTIZER = QuantLinearWithWeights
+
+@dataclass
+class Config:
+    batch_size: int = 6
+    seq_len: int = 1024
+    accumulate_steps: int = 8
+    lr: float = 4e-5
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR.parent / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.6
+    dataset_ratio_dpo: float = 0.2
+    dataset_ratio_rl: float = 0.2
+    shuffle_buffer_size: int = 10000
+    seed: int = 42
+    num_workers: int = 1
+    compile: bool = True
+    blend_steps: int = 10
+    kl_threshold: float = 0.1
+    hidden_mse_weight: float = 0.0
+    kl_weight: float = 1.0
+    weight_decay: float = 0.1
+    act_fn_lr_mult: float = 5.0
+    log_act_s_lr_mult: float = 20.0
+    log_diag_s_lr_mult: float = 10.0
+    log_weight_s_lr_mult: float = 1.0
+
+class PiecewiseActivation(nn.Module):
+    """Blend between SiLU (0.0) and learnable piecewise linear (1.0)."""
+
+    def __init__(
+        self,
+        k: float = 20.0,
+        delta: float = 0.05,
+        a_p: float = 1.0,
+        a_m: float = 0.05,
+        x0: float = -0.4,
+        y0: float = 0.2,
+    ) -> None:
+
+
+distill:  10%|████████▌                                                                             | 32/320 [05:50<48:17, 10.06s/it, kl=0.1351, ema_kl=0.1338, ema_mse=0.0024, blend=0.100, base_lr=4.00e-05, step=4, top1=0.893, flip=0.107]
+
+
+second try
+also uped the mse weight. 
+
+CHOSEN_ACTIVATION = PiecewiseActivation
+# GATE_UP_QUANTIZER = QuantLinearWithScales
+# DOWN_QUANTIZER = QuantLinearWithScales
+GATE_UP_QUANTIZER = QuantLinearWithWeights
+DOWN_QUANTIZER = QuantLinearWithWeights
+
+@dataclass
+class Config:
+    batch_size: int = 6
+    seq_len: int = 1024
+    accumulate_steps: int = 8
+    lr: float = 4e-5
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR.parent / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.6
+    dataset_ratio_dpo: float = 0.2
+    dataset_ratio_rl: float = 0.2
+    shuffle_buffer_size: int = 10000
+    seed: int = 42
+    num_workers: int = 1
+    compile: bool = True
+    blend_steps: int = 1
+    kl_threshold: float = 0.1
+    hidden_mse_weight: float = 4.0
+    kl_weight: float = 1.0
+    weight_decay: float = 0.1
+    act_fn_lr_mult: float = 5.0
+    log_act_s_lr_mult: float = 20.0
+    log_diag_s_lr_mult: float = 10.0
+    log_weight_s_lr_mult: float = 1.0
+
+class PiecewiseActivation(nn.Module):
+    """Blend between SiLU (0.0) and learnable piecewise linear (1.0)."""
+
+    def __init__(
+        self,
+        k: float = 20.0,
+        delta: float = 0.05,
+        a_p: float = 1.0,
+        a_m: float = 0.05,
+        x0: float = 0.2,
+        y0: float = 0.2,
+    ) -> None:
+
+
+starts out like at 5.
+step 22 at 3.75
+ok, killing this and trying again below with blending and 0.05 ceiling. also accum now 10 instead of 8.
+also for variety changes to 0.4 / 2*0.3
+
+
+CHOSEN_ACTIVATION = PiecewiseActivation
+# GATE_UP_QUANTIZER = QuantLinearWithScales
+# DOWN_QUANTIZER = QuantLinearWithScales
+GATE_UP_QUANTIZER = QuantLinearWithWeights
+DOWN_QUANTIZER = QuantLinearWithWeights
+
+@dataclass
+class Config:
+    batch_size: int = 6
+    seq_len: int = 1024
+    accumulate_steps: int = 10
+    lr: float = 4e-5
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR.parent / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.4
+    dataset_ratio_dpo: float = 0.3
+    dataset_ratio_rl: float = 0.3
+    shuffle_buffer_size: int = 10000
+    seed: int = 42
+    num_workers: int = 1
+    compile: bool = True
+    blend_steps: int = 20
+    kl_threshold: float = 0.05
+    hidden_mse_weight: float = 4.0
+    kl_weight: float = 1.0
+    weight_decay: float = 0.1
+    act_fn_lr_mult: float = 5.0
+    log_act_s_lr_mult: float = 20.0
+    log_diag_s_lr_mult: float = 10.0
+    log_weight_s_lr_mult: float = 1.0
+
+
+didn't go so well, i stopped it here, at 0.3 blend. i guess that 0.05 KL cap it too much, it probably would have finished but taken a long time. 0.05 is the best we got before using a 0.06 later cap.
+    distill:  30%|████████████████████████▎                                                        | 192/640 [34:52<1:16:19, 10.22s/it, kl=0.0649, ema_kl=0.0642, ema_mse=0.0025, blend=0.300, base_lr=4.00e-05, step=216, top1=0.915, flip=0.085]
+
+
+
+
+

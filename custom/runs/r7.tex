@@ -1,0 +1,47 @@
+i'm curious how far identity can go with batch size 6*32 = 192, without any blending. 
+i expect 0.1 like before. 
+
+0.6 step 40
+0.5 step 70
+0.4 step ..
+
+step 265 I give up, it's a bit above .3, I'm not gonna wait longer.
+
+CHOSEN_ACTIVATION = IdentityActivation
+# GATE_UP_QUANTIZER = QuantLinearWithScales
+# DOWN_QUANTIZER = QuantLinearWithScales
+GATE_UP_QUANTIZER = QuantLinearWithWeights
+DOWN_QUANTIZER = QuantLinearWithWeights
+
+@dataclass
+class Config:
+    batch_size: int = 6
+    seq_len: int = 1024
+    accumulate_steps: int = 4 * 8
+    lr: float = 2e-5
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR.parent / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.6
+    dataset_ratio_dpo: float = 0.2
+    dataset_ratio_rl: float = 0.2
+    shuffle_buffer_size: int = 10000
+    seed: int = 42
+    num_workers: int = 1
+    compile: bool = True
+    blend_steps: int = 1
+    kl_threshold: float = 0.4
+    hidden_mse_weight: float = 0.0
+    kl_weight: float = 1.0
+    weight_decay: float = 0.1
+    act_fn_lr_mult: float = 5.0
+    log_act_s_lr_mult: float = 20.0
+    log_diag_s_lr_mult: float = 10.0
+    log_weight_s_lr_mult: float = 1.0
+
+
+distill: 100%|███████████████████████████████████████████████████████████████████████████████████████| 32/32 [05:28<00:00,  9.80s/it, kl=1.9092, ema_kl=1.7637, ema_mse=0.0100, blend=1.000, base_lr=2.00e-05, step=4, top1=0.561, flip=0.439]

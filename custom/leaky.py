@@ -27,14 +27,14 @@ from ..utils import (
     resolve_model_path,
     argmax_stability_metrics
 )
-from .activation import PiecewiseActivation, IdentityActivation, LeakyActivation, OffsetReluActivation, SiluActivation
+from .activation import PiecewiseActivation, IdentityActivation
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 DIR = Path(__file__).resolve().parent
 
-CHOSEN_ACTIVATION = SiluActivation
+CHOSEN_ACTIVATION = PiecewiseActivation
 # GATE_UP_QUANTIZER = QuantLinearWithScales
 # DOWN_QUANTIZER = QuantLinearWithScales
 GATE_UP_QUANTIZER = QuantLinearWithWeights
@@ -42,10 +42,10 @@ DOWN_QUANTIZER = QuantLinearWithWeights
 
 @dataclass
 class Config:
-    batch_size: int = 8
+    batch_size: int = 6
     seq_len: int = 1024
     accumulate_steps: int = 16
-    lr: float = 4e-5
+    lr: float = 8e-5
     device: str = "cuda"
     dtype: str = "bfloat16"
     base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
@@ -53,15 +53,15 @@ class Config:
     dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
     dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
     dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
-    dataset_ratio_sft: float = 0.6
-    dataset_ratio_dpo: float = 0.2
-    dataset_ratio_rl: float = 0.2
-    shuffle_buffer_size: int = 10
+    dataset_ratio_sft: float = 0.8
+    dataset_ratio_dpo: float = 0.1
+    dataset_ratio_rl: float = 0.1
+    shuffle_buffer_size: int = 10000
     seed: int = 42
     num_workers: int = 1
     compile: bool = True
-    blend_steps: int = 0
-    kl_threshold: float = 0.4
+    blend_steps: int = 20
+    kl_threshold: float = 0.1
     hidden_mse_weight: float = 2.0
     kl_weight: float = 1.0
     weight_decay: float = 0.05

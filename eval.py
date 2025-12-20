@@ -10,6 +10,7 @@ from lm_eval.models.huggingface import HFLM
 from transformers import AutoTokenizer
 
 from .utils import resolve_model_path
+from . import custom_model  # noqa: F401
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,39 +26,27 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="Training step whose checkpoint should be evaluated.",
     )
-    parser.add_argument("--batch-size", type=int, default=6)
-    parser.add_argument("--seq-len", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
-        "--eval-include-teacher",
-        action="store_true",
-        help="Also evaluate the teacher model in lm_eval mode (slower).",
+        "--include-teacher",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also evaluate the teacher model in lm_eval mode (slower). Use --no-include-teacher to skip.",
     )
     parser.add_argument(
         "--tasks",
         type=str,
         nargs="+",
-        default=["boolq"],
+        default=["gsm8k"],
         help="Whitespace-separated lm_eval task names.",
     )
-    parser.add_argument("--num-fewshot", type=int, default=0)
     parser.add_argument(
         "--limit",
         type=float,
         default=1.0,
-        help="Optional number or fraction of examples per task (e.g., 1 or 0.01).",
-    )
-    parser.add_argument(
-        "--gen-max-new",
-        type=int,
-        default=64,
-        help="Cap on generated tokens for generation-style tasks.",
-    )
-    parser.add_argument(
-        "--gen-max-length",
-        type=int,
-        default=512,
-        help="Total length cap (prompt + generated) for generation-style tasks.",
+        help="Number or fraction of examples per task (e.g., 1 or 0.01). Use <=0 for no cap.",
     )
     parser.add_argument("--output", type=str, default="eval_results.json")
     args = parser.parse_args()
@@ -98,14 +87,14 @@ def main():
     args = parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_path)
-    gen_kwargs = {
-        "max_gen_toks": int(args.gen_max_new),
-        "do_sample": False,
-    }
 
     teacher_results = None
     with torch.no_grad():
         print("Evaluating student...")
+
+        # Interpret non-positive limit as "no cap" for lm_eval.
+        limit = None if args.limit is not None and args.limit <= 0 else args.limit
+
         student_lm = HFLM(
             pretrained=args.checkpoint_path,
             batch_size=args.batch_size,
@@ -120,16 +109,13 @@ def main():
 
         student_results = lm_eval.simple_evaluate(
             model=student_lm,
-            model_args=None,
             tasks=args.tasks,
             batch_size=args.batch_size,
-            num_fewshot=args.num_fewshot,
-            limit=args.limit,
-            gen_kwargs=gen_kwargs,
-            log_samples=False,
+            limit=limit,
+            confirm_run_unsafe_code=True,
         )
 
-        if args.eval_include_teacher:
+        if args.include_teacher:
             print("Evaluating teacher...")
             teacher_lm = HFLM(
                 pretrained=args.base_path,
@@ -142,13 +128,10 @@ def main():
 
             teacher_results = lm_eval.simple_evaluate(
                 model=teacher_lm,
-                model_args=None,
                 tasks=args.tasks,
                 batch_size=args.batch_size,
-                num_fewshot=args.num_fewshot,
-                limit=args.limit,
-                gen_kwargs=gen_kwargs,
-                log_samples=False,
+                limit=limit,
+                confirm_run_unsafe_code=True,
             )
 
 

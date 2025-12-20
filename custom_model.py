@@ -1,9 +1,10 @@
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.models.olmo3 import Olmo3Config, Olmo3ForCausalLM
+import torch
 import torch.nn as nn
 
 from a40.quant import QuantLinearWithWeights
-from a40.custom.activation import IdentityActivation
+from a40.custom.activation import IdentityActivation, PiecewiseActivation, OffsetReluActivation
 
 
 class MyOlmo3Config(Olmo3Config):
@@ -23,12 +24,10 @@ class MyOlmo3ForCausalLM(Olmo3ForCausalLM):
 
         for layer in self.model.layers:
             mlp = layer.mlp
-            act_fn = IdentityActivation().to(
-                device=mlp.gate_proj.weight.device, dtype=mlp.gate_proj.weight.dtype
+            mlp.act_fn = PiecewiseActivation().to(
+                device=mlp.gate_proj.weight.device,
+                dtype=mlp.gate_proj.weight.dtype,
             )
-            act_fn.set_blend(1.0)
-            mlp.act_fn = act_fn
-
             names = ["gate_proj", "up_proj", "down_proj"]
             for name in names:
                 linear_to_replace = getattr(mlp, name)

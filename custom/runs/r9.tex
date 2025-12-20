@@ -1,0 +1,87 @@
+took r8 and just changed from relu activation to offset leaky with the small 0.03 learned slope we found before.
+so i guess we just take the r8-111 as simplest since it's relu, and how eval is good enough. 
+running one last version of this with other params, won't mention here unless it works. 
+
+CHOSEN_ACTIVATION = OffsetLeakyActivation
+# GATE_UP_QUANTIZER = QuantLinearWithScales
+# DOWN_QUANTIZER = QuantLinearWithScales
+GATE_UP_QUANTIZER = QuantLinearWithWeights
+DOWN_QUANTIZER = QuantLinearWithWeights
+
+@dataclass
+class Config:
+    batch_size: int = 6
+    seq_len: int = 1024
+    accumulate_steps: int = 8
+    lr: float = 2e-5
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR.parent / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.6
+    dataset_ratio_dpo: float = 0.2
+    dataset_ratio_rl: float = 0.2
+    shuffle_buffer_size: int = 10000
+    seed: int = 42
+    num_workers: int = 1
+    compile: bool = True
+    blend_steps: int = 40
+    kl_threshold: float = 0.04
+    hidden_mse_weight: float = 0.0
+    kl_weight: float = 1.0
+    weight_decay: float = 0.1
+    act_fn_lr_mult: float = 5.0
+    log_act_s_lr_mult: float = 20.0
+    log_diag_s_lr_mult: float = 10.0
+    log_weight_s_lr_mult: float = 1.0
+
+    
+ended soon after here
+distill:   0%|                                                                                            | 0/1280 [18:58<?, ?it/s, kl=0.0478, ema_kl=0.0468, ema_mse=0.0017, blend=0.000, base_lr=1.00e-05, step=111, top1=0.933, flip=0.067]
+so doesn't seem better 
+
+
+ok... that second run, it's working.
+I reduced the LR to 1e-5 and then was gonna quit, but decide to raise to 8e-5 to see what happens. 
+
+@dataclass
+class Config:
+    batch_size: int = 6
+    seq_len: int = 1024
+    accumulate_steps: int = 8
+    lr: float = 4e-5
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR.parent / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.6
+    dataset_ratio_dpo: float = 0.2
+    dataset_ratio_rl: float = 0.2
+    shuffle_buffer_size: int = 10000
+    seed: int = 42
+    num_workers: int = 1
+    compile: bool = True
+    blend_steps: int = 40
+    kl_threshold: float = 0.04
+    hidden_mse_weight: float = 0.0
+    kl_weight: float = 1.0
+    weight_decay: float = 0.1
+    act_fn_lr_mult: float = 5.0
+    log_act_s_lr_mult: float = 20.0
+    log_diag_s_lr_mult: float = 10.0
+    log_weight_s_lr_mult: float = 1.0
+
+distill:  28%|██████████████████████▌                                                           | 352/1280 [23:41<14:34,  1.06it/s, kl=0.0393, ema_kl=0.0389, ema_mse=0.0021, blend=0.275, base_lr=6.00e-05, step=138, top1=0.933, flip=0.067]
+
+lowered to 6e-5. 
+i like how consistent it is here. KL not jumping so much. 
+ohhh, no this is not correct. it was blending, and only go through like 1/3. 
+
+ok, so this run isn't worth much. 
+ok, i'll do one more, r10 with trainable params but initialized like we found them before, no blend to see where it goes, and see if we can get better 

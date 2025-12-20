@@ -1,0 +1,51 @@
+
+
+
+CHOSEN_ACTIVATION = OffsetReluActivation
+# GATE_UP_QUANTIZER = QuantLinearWithScales
+# DOWN_QUANTIZER = QuantLinearWithScales
+GATE_UP_QUANTIZER = QuantLinearWithWeights
+DOWN_QUANTIZER = QuantLinearWithWeights
+
+@dataclass
+class Config:
+    batch_size: int = 6
+    seq_len: int = 1024
+    accumulate_steps: int = 8 * 8
+    lr: float = 2e-5
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR.parent / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.6
+    dataset_ratio_dpo: float = 0.2
+    dataset_ratio_rl: float = 0.2
+    shuffle_buffer_size: int = 10000
+    seed: int = 42
+    num_workers: int = 1
+    compile: bool = True
+    blend_steps: int = 40
+    kl_threshold: float = 0.04
+    hidden_mse_weight: float = 0.0
+    kl_weight: float = 1.0
+    weight_decay: float = 0.1
+    act_fn_lr_mult: float = 5.0
+    log_act_s_lr_mult: float = 20.0
+    log_diag_s_lr_mult: float = 10.0
+    log_weight_s_lr_mult: float = 1.0
+
+
+ended with
+distill:   0%|                                                                                            | 0/1280 [21:14<?, ?it/s, kl=0.0450, ema_kl=0.0455, ema_mse=0.0016, blend=0.000, base_lr=2.00e-05, step=123, top1=0.927, flip=0.073]
+
+r8-111
+
+this thing was not blending, so it's legit. 
+
+wait what?
+but the settings show show blend steps 40. 
+i would think that we screwed up and it didn't blend at all, except that i'm evaluating the model right now, and it ranks highly, and we do that with blend set at 1. 
+it actually wasn't, it was initially but then got overwritten by loading the state dict. 

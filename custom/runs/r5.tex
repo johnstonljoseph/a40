@@ -1,0 +1,130 @@
+call this a success using piecewise
+down to .04
+i want to investigate what these act params turned out to be, so we can initialize better. 
+
+CHOSEN_ACTIVATION = PiecewiseActivation
+# GATE_UP_QUANTIZER = QuantLinearWithScales
+# DOWN_QUANTIZER = QuantLinearWithScales
+GATE_UP_QUANTIZER = QuantLinearWithWeights
+DOWN_QUANTIZER = QuantLinearWithWeights
+
+@dataclass
+class Config:
+    batch_size: int = 8
+    seq_len: int = 1024
+    accumulate_steps: int = 16
+    lr: float = 8e-5
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR.parent / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.6
+    dataset_ratio_dpo: float = 0.2
+    dataset_ratio_rl: float = 0.2
+    shuffle_buffer_size: int = 10000
+    seed: int = 42
+    num_workers: int = 1
+    compile: bool = True
+    blend_steps: int = 20
+    kl_threshold: float = 0.06
+    hidden_mse_weight: float = 2.0
+    kl_weight: float = 1.0
+    weight_decay: float = 0.05
+    act_fn_lr_mult: float = 5.0
+    log_act_s_lr_mult: float = 20.0
+    log_diag_s_lr_mult: float = 10.0
+    log_weight_s_lr_mult: float = 1.0
+
+
+
+Ok, now we're running the same thing again, but with rl to zero, and sft to 0.9.
+also we initialized differently, according to what we found. the main difference is we 
+
+CHOSEN_ACTIVATION = PiecewiseActivation
+# GATE_UP_QUANTIZER = QuantLinearWithScales
+# DOWN_QUANTIZER = QuantLinearWithScales
+GATE_UP_QUANTIZER = QuantLinearWithWeights
+DOWN_QUANTIZER = QuantLinearWithWeights
+
+@dataclass
+class Config:
+    batch_size: int = 8
+    seq_len: int = 1024
+    accumulate_steps: int = 16
+    lr: float = 8e-5
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    base_path: str = "/workspace/.hf_home/hub/models--allenai--Olmo-3-7B-Think"
+    output_dir: str = str(DIR.parent / "checkpoints" / "student_final")
+    dataset_sft: Optional[str] = "allenai/Dolci-Think-SFT-7B"
+    dataset_dpo: Optional[str] = "allenai/Dolci-Think-DPO-7B"
+    dataset_rl: Optional[str] = None
+    # "allenai/Dolci-Think-RL-7B"
+    dataset_ratio_sft: float = 0.9
+    dataset_ratio_dpo: float = 0.1
+    dataset_ratio_rl: float = 0.0
+    shuffle_buffer_size: int = 10000
+    seed: int = 42
+    num_workers: int = 1
+    compile: bool = True
+    blend_steps: int = 20
+    kl_threshold: float = 0.06
+    hidden_mse_weight: float = 2.0
+    kl_weight: float = 1.0
+    weight_decay: float = 0.05
+    act_fn_lr_mult: float = 5.0
+    log_act_s_lr_mult: float = 20.0
+    log_diag_s_lr_mult: float = 10.0
+    log_weight_s_lr_mult: float = 1.0
+
+
+distill:   5%|████▏                                                                               | 32/640 [07:54<2:18:59, 13.72s/it, kl=0.2549, ema_kl=0.1340, ema_mse=0.0016, blend=0.050, base_lr=8.00e-05, step=2, top1=0.871, flip=0.129]
+
+distill:  80%|███████████████████████████████████████████████████████████████████▏                | 512/640 [30:30<05:52,  2.75s/it, kl=0.0553, ema_kl=0.0585, ema_mse=0.0040, blend=0.800, base_lr=8.00e-05, step=50, top1=0.935, flip=0.065]
+
+distill: 100%|████████████████████████████████████████████████████████████████████████████████████| 640/640 [35:14<00:00,  2.05s/it, kl=0.0536, ema_kl=0.0554, ema_mse=0.0040, blend=1.000, base_lr=8.00e-05, step=61, top1=0.932, flip=0.068]
+note it took 35 mins to blend. 
+
+lowered lr, then raised it again remembering we got down to 0.3 with it on 8e-5. KL rose but is now returning down.
+distill: 100%|███████████████████████████████████████████████████████████████████████████████████| 640/640 [47:20<00:00,  2.05s/it, kl=0.0759, ema_kl=0.0829, ema_mse=0.0038, blend=1.000, base_lr=8.00e-05, step=104, top1=0.905, flip=0.095]
+
+
+% (main) root@C.28860061:/workspace$ /venv/main/bin/python /workspace/a40/dump_activation_params.py --ckpt /workspace/a40/checkpoints/r5-159
+% Found activation parameters for 32 layers in /workspace/a40/checkpoints/r5-159
+% Layer 00: a_p=1.000000, a_m=0.109863, x0=-0.205078, y0=0.200195
+% Layer 01: a_p=1.000000, a_m=0.105957, x0=-0.200195, y0=0.204102
+% Layer 02: a_p=1.000000, a_m=0.110840, x0=-0.197266, y0=0.205078
+% Layer 03: a_p=1.000000, a_m=0.104004, x0=-0.200195, y0=0.200195
+% Layer 04: a_p=1.000000, a_m=0.105469, x0=-0.198242, y0=0.200195
+% Layer 05: a_p=1.000000, a_m=0.095703, x0=-0.197266, y0=0.199219
+% Layer 06: a_p=1.000000, a_m=0.097656, x0=-0.200195, y0=0.200195
+% Layer 07: a_p=1.000000, a_m=0.093262, x0=-0.200195, y0=0.199219
+% Layer 08: a_p=1.000000, a_m=0.105957, x0=-0.201172, y0=0.199219
+% Layer 09: a_p=1.000000, a_m=0.102051, x0=-0.204102, y0=0.200195
+% Layer 10: a_p=1.000000, a_m=0.104492, x0=-0.200195, y0=0.202148
+% Layer 11: a_p=1.000000, a_m=0.105469, x0=-0.200195, y0=0.202148
+% Layer 12: a_p=1.000000, a_m=0.102539, x0=-0.200195, y0=0.202148
+% Layer 13: a_p=1.000000, a_m=0.100586, x0=-0.200195, y0=0.204102
+% Layer 14: a_p=1.000000, a_m=0.104492, x0=-0.200195, y0=0.201172
+% Layer 15: a_p=1.000000, a_m=0.095215, x0=-0.200195, y0=0.202148
+% Layer 16: a_p=1.000000, a_m=0.087402, x0=-0.200195, y0=0.202148
+% Layer 17: a_p=1.000000, a_m=0.074219, x0=-0.200195, y0=0.201172
+% Layer 18: a_p=1.000000, a_m=0.062500, x0=-0.196289, y0=0.203125
+% Layer 19: a_p=1.000000, a_m=0.057373, x0=-0.196289, y0=0.200195
+% Layer 20: a_p=1.000000, a_m=0.044922, x0=-0.185547, y0=0.203125
+% Layer 21: a_p=1.000000, a_m=0.028320, x0=-0.178711, y0=0.200195
+% Layer 22: a_p=1.000000, a_m=0.019653, x0=-0.186523, y0=0.203125
+% Layer 23: a_p=1.000000, a_m=0.016357, x0=-0.185547, y0=0.203125
+% Layer 24: a_p=1.000000, a_m=0.010742, x0=-0.190430, y0=0.205078
+% Layer 25: a_p=1.000000, a_m=0.028931, x0=-0.185547, y0=0.203125
+% Layer 26: a_p=1.000000, a_m=0.024170, x0=-0.182617, y0=0.204102
+% Layer 27: a_p=1.000000, a_m=0.017212, x0=-0.196289, y0=0.205078
+% Layer 28: a_p=1.000000, a_m=0.009216, x0=-0.194336, y0=0.196289
+% Layer 29: a_p=1.000000, a_m=0.002518, x0=-0.190430, y0=0.187500
+% Layer 30: a_p=1.000000, a_m=0.004761, x0=-0.201172, y0=0.190430
+% Layer 31: a_p=1.000000, a_m=0.007385, x0=-0.202148, y0=0.198242
+
+so next time we can probably just hardcode these at 1, 0.1, -0.2, 0.2, which is how we initialized them except we did 0.05 for a_m, notice some values went down, others up. I think better to go up for more gradient. 
