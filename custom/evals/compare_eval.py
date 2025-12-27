@@ -216,7 +216,7 @@ def main() -> None:
         "--ci-mult",
         type=float,
         default=1.0,
-        help="Multiplier for stderr to show alongside percentages (e.g., 1.96 for ~95% CI).",
+        help="Multiplier for stderr to show alongside percentages (e.g., 1.96 for ~95%% CI).",
     )
     parser.add_argument(
         "--mmlu-only",

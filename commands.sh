@@ -38,6 +38,6 @@ rclone copy a40/checkpoints/student_final/r5-62/ \
 
 
 # download
-rclone copy gdrive:checkpoints/r8-111 /workspace/a40/checkpoints/r5-62 --progress
+rclone copy gdrive:checkpoints/r5-159 /workspace/a40/checkpoints/r5-159 --progress
 
 

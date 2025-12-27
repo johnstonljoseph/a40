@@ -48,19 +48,19 @@ class MyOlmo3ForCausalLM(Olmo3ForCausalLM):
                     linear.to(device=target_device, dtype=target_dtype)
 
 
-class MyOlmo3MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = QuantLinearWithWeights(self.hidden_size, self.intermediate_size)
-        self.up_proj = QuantLinearWithWeights(self.hidden_size, self.intermediate_size)
-        self.down_proj = QuantLinearWithWeights(self.intermediate_size, self.hidden_size)
+# class MyOlmo3MLP(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.config = config
+#         self.hidden_size = config.hidden_size
+#         self.intermediate_size = config.intermediate_size
+#         self.gate_proj = QuantLinearWithWeights(self.hidden_size, self.intermediate_size)
+#         self.up_proj = QuantLinearWithWeights(self.hidden_size, self.intermediate_size)
+#         self.down_proj = QuantLinearWithWeights(self.intermediate_size, self.hidden_size)
 
-    def forward(self, x):
-        down_proj = self.down_proj(self.gate_proj(x) * self.up_proj(x))
-        return down_proj
+#     def forward(self, x):
+#         down_proj = self.down_proj(self.gate_proj(x) * self.up_proj(x))
+#         return down_proj
 
 
 # Enable auto-loading of the quantized subclass via AutoModelForCausalLM/AutoConfig
